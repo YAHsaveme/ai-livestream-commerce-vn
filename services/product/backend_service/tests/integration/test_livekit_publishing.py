@@ -6,6 +6,8 @@ import asyncio
 
 import pytest
 
+from approved_speech_helpers import authorize_session
+
 from backend.config import AppConfig
 from backend.application.publishing import LiveKitPublisherRegistry
 from backend.application.render.windows import AudioWindow
@@ -136,7 +138,13 @@ async def test_stop_drops_a_publish_already_waiting_for_its_publisher_lock() -> 
     assert registry.session_ids == ()
 
 
-def test_streaming_session_forwards_pcm_and_stops_its_publisher() -> None:
+def test_streaming_session_forwards_pcm_and_stops_its_publisher(monkeypatch) -> None:
+    # Lift only the P0 direct-say guard to exercise downstream publishing;
+    # approved-speech validation remains active.
+    async def _allow(d, req):
+        return None
+
+    monkeypatch.setattr("backend.api.v1.sessions._reject_p0_direct_say", _allow)
     factory = _Factory()
     registry = LiveKitPublisherRegistry(factory, enabled_predicate=lambda: True)
     config = AppConfig(render_backend="mock", app_env="dev")
@@ -150,7 +158,11 @@ def test_streaming_session_forwards_pcm_and_stops_its_publisher() -> None:
     with TestClient(create_app(config=config, deps=deps)) as client:
         started = client.post("/api/v1/sessions", json={}).json()
         session_id = started["session_id"]
-        say = client.post(f"/api/v1/sessions/{session_id}/say", json={"text": "Xin chào"})
+        text = "Xin chào"
+        client.portal.call(authorize_session, client.app.state.container, session_id, text)
+        say = client.post(
+            f"/api/v1/sessions/{session_id}/say", json={"text": text, "generate": False}
+        )
         assert say.status_code == 200, say.text
         stop = client.post(f"/api/v1/sessions/{session_id}/stop")
         assert stop.status_code == 200, stop.text

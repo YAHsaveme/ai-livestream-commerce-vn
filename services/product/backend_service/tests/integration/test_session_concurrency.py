@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from typing import Iterator
 
 import httpx
@@ -206,10 +207,18 @@ async def test_concurrent_say_one_200_one_409(mock_env: None):
     is rejected as already_speaking (409)."""
     from backend.main import create_app
 
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingTTS(_StubTTS):
+        def stream_audio(self, *args, **kwargs):
+            started.set()
+            if not release.wait(timeout=10):
+                raise AssertionError("concurrent request did not release speech")
+            yield from super().stream_audio(*args, **kwargs)
+
     backend = MockRenderBackend()
-    deps = _deps_with_stubs(
-        llm=_SlowStubLLM(n_chunks=10, delay_s=0.02), tts=_StubTTS(), backend=backend
-    )
+    deps = _deps_with_stubs(llm=_FastStubLLM(), tts=BlockingTTS(), backend=backend)
     app = create_app(config=_prod_cfg(), deps=deps)
 
     # Start a session.
@@ -219,12 +228,19 @@ async def test_concurrent_say_one_200_one_409(mock_env: None):
         assert start.status_code == 200
         sid = start.json()["session_id"]
 
-        # Fire two says concurrently on that session.
-        await authorize_session(app.state.container, sid, "".join(f"chunk {i}." for i in range(10)))
-        r1, r2 = await asyncio.gather(
-            client.post(f"/api/v1/sessions/{sid}/say", json={"text": "first"}),
-            client.post(f"/api/v1/sessions/{sid}/say", json={"text": "second"}),
+        # Hold approved verbatim speech downstream while the second say contends.
+        text = "Ba tr\u0103m n\u0103m m\u01b0\u01a1i ngh\u00ecn \u0111\u1ed3ng."
+        await authorize_session(app.state.container, sid, text)
+        payload = {"session_id": sid, "text": text, "generate": False}
+        first = asyncio.create_task(
+            client.post(f"/api/v1/sessions/{sid}/say", json=payload)
         )
+        try:
+            assert await asyncio.to_thread(started.wait, 5), "first say never reached TTS"
+            r2 = await client.post(f"/api/v1/sessions/{sid}/say", json=payload)
+        finally:
+            release.set()
+            r1 = await asyncio.wait_for(first, timeout=10)
         codes = sorted([r1.status_code, r2.status_code])
         assert codes == [200, 409], f"expected [200, 409], got {codes}"
         # The 409 body must carry already_speaking in the canonical envelope.

@@ -24,6 +24,13 @@ import tempfile
 from pathlib import Path
 
 _BACKEND_SERVICE_DIR = Path(__file__).resolve().parents[2]
+_PRODUCT_DIR = _BACKEND_SERVICE_DIR.parent
+_RUNTIME_SOURCES = (
+    ("backend_service", "backend"),
+    ("llm_service", "llm"),
+    ("tts_service", "tts"),
+    ("avatar_service", "avatar"),
+)
 
 
 def _load_check_src() -> str:
@@ -36,27 +43,31 @@ def _load_check_src() -> str:
 
 
 def _build_image_like_layout(root: Path, *, include_resources: bool) -> Path:
-    """Mirror the runtime-stage layout: /app/services/product/backend_service.
+    """Mirror the runtime-stage source layout under ``/app/services/product``.
 
-    ``src/backend`` is always present (the image always has it); ``resources``
-    is present only when the Dockerfile COPY is honored.
+    The production image always carries backend plus the canonical llm/tts/avatar
+    sibling sources; ``resources`` is present only when the Dockerfile COPY is honored.
     """
-    target = root / "services" / "product" / "backend_service"
+    product_root = root / "services" / "product"
+    target = product_root / "backend_service"
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-    (target / "src").mkdir(parents=True)
-    shutil.copytree(
-        _BACKEND_SERVICE_DIR / "src" / "backend",
-        target / "src" / "backend",
-        ignore=ignore,
-    )
+    for service, package in _RUNTIME_SOURCES:
+        destination = product_root / service / "src" / package
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(_PRODUCT_DIR / service / "src" / package, destination, ignore=ignore)
     if include_resources:
         shutil.copytree(_BACKEND_SERVICE_DIR / "resources", target / "resources")
     return target
 
 
+def _runtime_pythonpath(target: Path) -> str:
+    product_root = target.parent
+    return os.pathsep.join(str(product_root / service / "src") for service, _ in _RUNTIME_SOURCES)
+
+
 def _run_artifact_checks(target: Path, check_src: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(target / "src")
+    env["PYTHONPATH"] = _runtime_pythonpath(target)
     return subprocess.run(
         [sys.executable, "-c", check_src],
         cwd=target,
@@ -96,7 +107,7 @@ def test_content_hash_stable_across_layout() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         target = _build_image_like_layout(Path(tmp), include_resources=True)
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(target / "src")
+        env["PYTHONPATH"] = _runtime_pythonpath(target)
         proc = subprocess.run(
             [
                 sys.executable,

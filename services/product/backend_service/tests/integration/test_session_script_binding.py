@@ -171,7 +171,12 @@ class _FakeDirectorRuntime:
         session = type(
             "S", (), {"catalog": [type("P", (), {"id": pid})() for pid in product_ids]}
         )()
-        self._sessions = {"sess": session}
+        # Catalog fixture belongs to a separate attached session. The HTTP
+        # sessions created below remain unattached until an explicit attach.
+        self._sessions = {"catalog-session": session}
+
+    def has(self, session_id: str) -> bool:
+        return session_id in self._sessions
 
     def detach(self, session_id: str) -> None:  # noqa: ARG002
         self._sessions.pop(session_id, None)

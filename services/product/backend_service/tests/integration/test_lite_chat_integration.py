@@ -112,7 +112,7 @@ def test_p0_attach_binding_enforced_at_http_events_boundary(mock_env: None) -> N
             "occurred_at": time.time(),
             "type": "viewer.comment",
             "viewer": {"viewer_id": "viewer-1"},
-            "payload": {"text": "ắ" * 1000},
+            "payload": {"text": "ắ" * (1000 - len(" Gia bao nhieu?")) + " Gia bao nhieu?"},
         }
         accepted = client.post(f"/api/v1/sessions/{sid}/events", json={"events": [event]})
         assert accepted.status_code == 200, accepted.text
@@ -239,7 +239,7 @@ def test_events_without_attach_are_accepted_and_parked(mock_env: None) -> None:
 
         r = client.post(
             f"/api/v1/sessions/{sid}/events",
-            json={"events": [_event("hello", "test", "evt-noattach")]},
+            json={"events": [_event("Gia bao nhieu?", "test", "evt-noattach")]},
         )
         assert r.status_code == 200
         assert r.json()["accepted"] == 1

@@ -140,6 +140,11 @@
             ],
             "title": "Idempotency Key"
           },
+          "ordered_units": {
+            "default": false,
+            "title": "Ordered Units",
+            "type": "boolean"
+          },
           "product_ids": {
             "items": {
               "type": "string"
@@ -147,6 +152,11 @@
             "maxItems": 200,
             "title": "Product Ids",
             "type": "array"
+          },
+          "replace_existing": {
+            "default": false,
+            "title": "Replace Existing",
+            "type": "boolean"
           },
           "target_duration_s": {
             "maximum": 7200.0,
@@ -268,6 +278,85 @@
           "display_text"
         ],
         "title": "DraftIn",
+        "type": "object"
+      },
+      "DraftPartIn": {
+        "description": "One displayed part; ``segment_id`` is empty for a part the owner just added.",
+        "properties": {
+          "display_text": {
+            "maxLength": 200000,
+            "minLength": 1,
+            "title": "Display Text",
+            "type": "string"
+          },
+          "part_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Part Id"
+          },
+          "segment_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Id"
+          }
+        },
+        "required": [
+          "display_text"
+        ],
+        "title": "DraftPartIn",
+        "type": "object"
+      },
+      "DraftPartsIn": {
+        "description": "Structured save: the exact ordered parts the owner sees (never a source claim).",
+        "properties": {
+          "expected_version_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Expected Version Id",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "parts": {
+            "items": {
+              "$ref": "#/components/schemas/DraftPartIn"
+            },
+            "maxItems": 200,
+            "minItems": 1,
+            "title": "Parts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_version_id",
+          "parts"
+        ],
+        "title": "DraftPartsIn",
         "type": "object"
       },
       "EngineSwapReq": {
@@ -1698,6 +1787,19 @@
       "RegenerateReq": {
         "description": "Explicit human action: regenerate one segment as a new immutable version.",
         "properties": {
+          "expected_version_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version Id"
+          },
           "idempotency_key": {
             "anyOf": [
               {
@@ -1710,6 +1812,34 @@
               }
             ],
             "title": "Idempotency Key"
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "enum": [
+                  "recap",
+                  "intro"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intent"
+          },
+          "part_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Part Id"
           }
         },
         "title": "RegenerateReq",
@@ -2258,6 +2388,18 @@
       },
       "StartReq": {
         "properties": {
+          "avatar_agent_id": {
+            "anyOf": [
+              {
+                "maxLength": 38,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Agent Id"
+          },
           "avatar_id": {
             "anyOf": [
               {
@@ -2269,6 +2411,30 @@
               }
             ],
             "title": "Avatar Id"
+          },
+          "avatar_image_url": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Image Url"
+          },
+          "avatar_provider": {
+            "anyOf": [
+              {
+                "const": "lemonslice",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Provider"
           },
           "business_session_id": {
             "anyOf": [
@@ -2303,6 +2469,17 @@
             ],
             "title": "Generation"
           },
+          "host_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Name"
+          },
           "is_sandbox": {
             "default": true,
             "title": "Is Sandbox",
@@ -2323,6 +2500,18 @@
               }
             ],
             "title": "Tenant Id"
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Id"
           }
         },
         "title": "StartReq",
@@ -2587,6 +2776,28 @@
           "viewer_id"
         ],
         "title": "ViewerRef",
+        "type": "object"
+      },
+      "VoicePreviewReq": {
+        "properties": {
+          "text": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "voice_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Voice Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "voice_id"
+        ],
+        "title": "VoicePreviewReq",
         "type": "object"
       }
     }
@@ -3860,6 +4071,67 @@
         "summary": "Put Draft"
       }
     },
+    "/api/v1/script-sets/{set_id}/products/{product_id}/draft-parts": {
+      "put": {
+        "description": "Structured save keeping each unchanged part's identity and provenance.",
+        "operationId": "put_draft_parts_api_v1_script_sets__set_id__products__product_id__draft_parts_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "set_id",
+            "required": true,
+            "schema": {
+              "title": "Set Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "product_id",
+            "required": true,
+            "schema": {
+              "title": "Product Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DraftPartsIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Draft Parts Api V1 Script Sets  Set Id  Products  Product Id  Draft Parts Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Draft Parts"
+      }
+    },
     "/api/v1/script-sets/{set_id}/products/{product_id}/fix": {
       "post": {
         "description": "Constrained AI repair for a gate-failed version (task 11.6).\n\nEligible only for gate-failed immutable versions; otherwise 409\n``fix_not_eligible``. The fixed result is a new DRAFT that must be\nsubmitted again \u2014 never auto-approved.",
@@ -4162,6 +4434,65 @@
           }
         },
         "summary": "Submit For Gate"
+      }
+    },
+    "/api/v1/script-sets/{set_id}/products/{product_id}/workflows/{workflow_id}": {
+      "get": {
+        "operationId": "workflow_status_api_v1_script_sets__set_id__products__product_id__workflows__workflow_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "set_id",
+            "required": true,
+            "schema": {
+              "title": "Set Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "product_id",
+            "required": true,
+            "schema": {
+              "title": "Product Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Workflow Status Api V1 Script Sets  Set Id  Products  Product Id  Workflows  Workflow Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Workflow Status"
       }
     },
     "/api/v1/sessions": {
@@ -4596,6 +4927,47 @@
         "summary": "Sessions Interrupt"
       }
     },
+    "/api/v1/sessions/{session_id}/live-follow": {
+      "get": {
+        "operationId": "get_live_follow_api_v1_sessions__session_id__live_follow_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Live Follow Api V1 Sessions  Session Id  Live Follow Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Live Follow"
+      }
+    },
     "/api/v1/sessions/{session_id}/plan/create": {
       "post": {
         "description": "Generate a minimal deterministic RunPlan and store on the session.",
@@ -4797,6 +5169,141 @@
           }
         },
         "summary": "Sessions Stop"
+      }
+    },
+    "/api/v1/tts/endpoint": {
+      "delete": {
+        "operationId": "delete_tts_endpoint_api_v1_tts_endpoint_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Tts Endpoint Api V1 Tts Endpoint Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Delete Tts Endpoint"
+      },
+      "get": {
+        "operationId": "get_tts_endpoint_api_v1_tts_endpoint_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Tts Endpoint Api V1 Tts Endpoint Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Tts Endpoint"
+      },
+      "put": {
+        "operationId": "put_tts_endpoint_api_v1_tts_endpoint_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Tts Endpoint Api V1 Tts Endpoint Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Tts Endpoint"
+      }
+    },
+    "/api/v1/tts/preview": {
+      "post": {
+        "description": "WAV of a voice from the offered list saying a short text; same trust gate as GET /tts/voices.",
+        "operationId": "tts_preview_api_v1_tts_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoicePreviewReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tts Preview"
+      }
+    },
+    "/api/v1/tts/voices": {
+      "get": {
+        "operationId": "tts_voices_api_v1_tts_voices_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tts Voices Api V1 Tts Voices Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Tts Voices"
       }
     }
   }
