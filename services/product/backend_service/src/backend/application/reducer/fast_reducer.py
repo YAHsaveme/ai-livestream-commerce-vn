@@ -22,6 +22,7 @@ sentence-transformers) never blocks the event loop. The clock is injectable
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -36,6 +37,18 @@ from .cluster_store import (
 )
 
 __all__ = ["AcceptedComment", "FastReducer", "FastReducerConfig"]
+
+logger = logging.getLogger(__name__)
+
+
+def source_lag_ms(ts: object, *, now: Optional[float] = None) -> object:
+    """Age of a comment on arrival in ms, or "na" when ``ts`` is not a finite number. Used only for logging, so it
+    must never raise: a malformed timestamp would otherwise change ingestion behavior."""
+    try:
+        age = ((time.time() if now is None else now) - float(ts)) * 1000  # type: ignore[arg-type]
+        return int(age) if age == age and abs(age) != float("inf") else "na"
+    except (TypeError, ValueError, OverflowError):
+        return "na"
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,22 @@ class _SessionState:
     embed_calls: int = 0
     cache_hits: int = 0
     wake_notifications: int = 0
+    failures: int = 0
+    inflight: set = field(default_factory=set)  # comment ids of the batch being embedded
+    batch_limit: Optional[int] = None  # bisect: max items per attempt after repeated failure
+    item_failures: dict = field(default_factory=dict)  # comment_id -> failed attempts
+    quarantined: int = 0
+    last_batch: list = field(default_factory=list)
+    retry_at: float = 0.0
+    # P0-FB-014: per-session catalog + current product, used by run_once
+    # routing in place of the process-global config. Without it two sessions
+    # would resolve product candidates against each other's catalog.
+    products: list[Any] = field(default_factory=list)
+    current_product_id: Optional[str] = None
+    # comment_id -> (event_id, provenance, occurred_at), kept BESIDE the store
+    # because the envelope's trust boundary excludes member/viewer ids. Bounded
+    # by the same horizon as the demand list and pruned with it.
+    provenance: dict[str, tuple[str, dict, float]] = field(default_factory=dict)
 
 
 class FastReducer:
@@ -160,6 +189,21 @@ class FastReducer:
         # last typed failure, so a failed pass never crashes the fast lane.
         self._reconciliation_failures: dict[str, int] = {}
         self._last_reconciliation_failure: dict[str, ReconciliationFailure] = {}
+        # Optional read-only observer ``(session_id, store, now)`` called after the store's
+        # membership changed (batch assigned/expired, reconciliation). Failures are logged
+        # and ignored: observation never affects clustering.
+        self.membership_observer: Optional[Callable[[str, ClusterStore, float], None]] = None
+
+    def _observe_membership(self, session_id: str, store: ClusterStore, now: float) -> None:
+        observer = self.membership_observer
+        if observer is None:
+            return
+        try:
+            observer(session_id, store, now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "membership observer failed session=%s error=%s", session_id, type(exc).__name__
+            )
 
     # ------------------------------------------------------------------
     # Per-session cluster store (5.3)
@@ -203,12 +247,104 @@ class FastReducer:
         """
         state = self._sessions.setdefault(session_id, _SessionState())
         if comment is not None:
+            if comment.comment_id not in state.provenance:
+                # Age on arrival (a redelivery keeps its original age and is not logged again): the platform ->
+                # API -> Runtime part of the delay before a viewer hears the answer.
+                logger.info(
+                    "comment accepted session=%s source_lag_ms=%s",
+                    session_id,
+                    source_lag_ms(comment.ts),
+                )
             state.pending.append(comment)
+            state.pending = state.pending[-self._config.max_pending :]
+            if len(state.provenance) > 4 * self._config.max_pending:
+                self._prune(state, session_id)  # bounded even while embedding is down
             if state.first_pending_ts is None:
                 state.first_pending_ts = comment.ts
+            # Provenance travels beside the store (P0-FB-014): a retried
+            # comment_id keeps the ORIGINAL event_id and occurred_at, so age is
+            # never reset by a redelivery.
+            state.provenance.setdefault(
+                comment.comment_id,
+                (comment.event_id, dict(comment.provenance or {}), comment.ts),
+            )
         state.wake_notifications += 1
         state.wake_event.set()
         self._any_wake.set()
+
+    # ------------------------------------------------------------------
+    # Per-session catalog + lifetime (P0-FB-014)
+    # ------------------------------------------------------------------
+
+    def set_session_catalog(
+        self,
+        session_id: str,
+        products: list[Any],
+        current_product_id: Optional[str] = None,
+    ) -> None:
+        """Bind THIS session's approved catalog for product routing.
+
+        ``FastReducerConfig.products`` is process-global and empty in
+        production, which makes product resolution inert. Per-session binding
+        is what makes a candidate resolve against the session's own approved
+        products instead of nothing (or someone else's).
+        """
+        state = self._sessions.setdefault(session_id, _SessionState())
+        state.products = list(products)
+        state.current_product_id = current_product_id
+
+    def session_catalog(self, session_id: str) -> tuple[list[Any], Optional[str]]:
+        state = self._sessions.get(session_id)
+        if state is None:
+            return [], None
+        return list(state.products), state.current_product_id
+
+    def drop_session(self, session_id: str) -> None:
+        """Drop ALL per-session state so a reattached id inherits nothing.
+
+        The store, pending batch, embedding cache, demand list, provenance and
+        the per-session counters all go. Without this a reattached session id
+        would find the previous generation's clusters, answered state and
+        provenance still live (P0-FB-014).
+        """
+        self._sessions.pop(session_id, None)
+        self._stores.pop(session_id, None)
+        self._reconciles_run.pop(session_id, None)
+        self._reconcile_merged_total.pop(session_id, None)
+        self._reconcile_split_total.pop(session_id, None)
+        self._last_reconcile.pop(session_id, None)
+        self._reconciliation_failures.pop(session_id, None)
+        self._last_reconciliation_failure.pop(session_id, None)
+
+    def session_active(self, session_id: str) -> bool:
+        return session_id in self._sessions or session_id in self._stores
+
+    def pending_count(self, session_id: str) -> int:
+        state = self._sessions.get(session_id)
+        return len(state.pending) if state is not None else 0
+
+    def session_store(self, session_id: str) -> Optional[ClusterStore]:
+        """The session's ClusterStore, or None when it has no state.
+
+        None is the REFUSE signal for reducer mode: a caller must not fall back
+        to a legacy feed when the reducer has nothing for this session.
+        """
+        return self._stores.get(session_id)
+
+    def provenance_for(self, session_id: str, comment_id: str) -> Optional[dict]:
+        """The stored provenance for one comment id, or None once pruned."""
+        state = self._sessions.get(session_id)
+        if state is None:
+            return None
+        record = state.provenance.get(comment_id)
+        return None if record is None else record[1]
+
+    def comment_provenance(self, session_id: str, comment_id: str) -> Optional[tuple]:
+        """``(event_id, provenance, occurred_at)`` for one comment id."""
+        state = self._sessions.get(session_id)
+        if state is None:
+            return None
+        return state.provenance.get(comment_id)
 
     # ------------------------------------------------------------------
     # Coalescing deadline (pure function of the injected clock)
@@ -225,7 +361,10 @@ class FastReducer:
         state = self._sessions.get(session_id)
         if state is None or state.first_pending_ts is None:
             return None
-        return state.first_pending_ts + self._config.microbatch_max_wait_ms / 1000.0
+        return max(
+            state.retry_at,
+            state.first_pending_ts + self._config.microbatch_max_wait_ms / 1000.0,
+        )
 
     def drain_batch(self, session_id: str, now: float) -> list[AcceptedComment]:
         """Return and clear the pending batch (bounded, oldest dropped).
@@ -260,9 +399,23 @@ class FastReducer:
         it; clustering/ranking are NOT implemented here (C5/C6 scope).
         """
         state = self._sessions.setdefault(session_id, _SessionState())
-        batch = self.drain_batch(session_id, now)
+        # Acknowledge only after successful processing. New arrivals while encode
+        # runs stay pending; a failed encode leaves the original batch retryable.
+        batch = list(state.pending[-self._config.max_pending :])
+        if state.batch_limit is not None:
+            batch = batch[: state.batch_limit]
         if not batch:
             return []
+        state.inflight = {c.comment_id for c in batch}
+        state.last_batch = [c.comment_id for c in batch]
+        try:
+            return await self._process_batch(state, session_id, batch, now)
+        finally:
+            state.inflight = set()
+
+    async def _process_batch(
+        self, state: _SessionState, session_id: str, batch: list, now: float
+    ) -> list[AcceptedComment]:
         new_only = [
             c
             for c in batch
@@ -273,6 +426,10 @@ class FastReducer:
             state.cache_hits += cache_hits
         if new_only:
             vectors = await asyncio.to_thread(self._embedder.encode, [c.text for c in new_only])
+            if self._sessions.get(session_id) is not state:
+                return []  # stopped/replaced while the worker was suspended
+            if len(vectors) != len(new_only):
+                raise ValueError("embedding result count mismatch")
             state.embed_calls += 1
             for comment, vector in zip(new_only, vectors):
                 state.cache[comment.comment_id] = (comment.text, list(vector))
@@ -293,17 +450,26 @@ class FastReducer:
         state.embedded_total += len(embedded)
         cutoff = now - self._config.rolling_horizon_sec
         state.demand = [d for d in state.demand if d["ts"] >= cutoff]
+        # Provenance is bounded by the SAME horizon as the demand list, so it can
+        # never outlive the member it describes.
+        state.provenance = {
+            cid: record for cid, record in state.provenance.items() if record[2] >= cutoff
+        }
         store = self._get_store(session_id)
         # Lazy import: routing imports director.clustering, which never imports
         # the reducer package (reducer only used this seam to avoid a cycle).
         from ..director.routing import route_hints
 
+        # Per-session catalog when one is bound (P0-FB-014); the process-global
+        # config stays the fallback for a session nobody bound.
+        products = state.products or self._config.products
+        current_product_id = (
+            state.current_product_id if state.products else self._config.current_product_id
+        )
         for comment in batch:
             entry = state.cache.get(comment.comment_id)
             if entry is not None and entry[0] == comment.text:
-                hints = route_hints(
-                    comment.text, self._config.products, self._config.current_product_id
-                )
+                hints = route_hints(comment.text, products, current_product_id)
                 candidates = [
                     ProductCandidate(pid, score, evidence)
                     for pid, score, evidence in hints.product_candidates
@@ -321,7 +487,52 @@ class FastReducer:
                 )
         # Write-path expiry keeps store memory bounded as the horizon advances (5.4).
         store.expire(now)
+        self._observe_membership(session_id, store, now)
+        acknowledged = {id(c) for c in batch}
+        state.pending = [c for c in state.pending if id(c) not in acknowledged]
+        state.first_pending_ts = state.pending[0].ts if state.pending else None
+        state.wake_event.clear()
+        state.failures, state.retry_at = 0, 0.0
+        state.batch_limit = None
+        for c in batch:
+            state.item_failures.pop(c.comment_id, None)
+        state.demand = state.demand[-self._config.max_pending :]
+        self._prune(state, session_id)
         return batch
+
+    MAX_ITEM_FAILURES = 3
+
+    def _note_failure(self, state: _SessionState, session_id: str, now: float) -> None:
+        """Bounded backoff; from the 2nd failure bisect the batch to isolate a poison item,
+        and quarantine (log + drop) a single item that keeps failing alone."""
+        state.failures += 1
+        state.retry_at = now + min(2.0 ** (state.failures - 1), 30.0)
+        batch = state.last_batch
+        for cid in batch:
+            state.item_failures[cid] = state.item_failures.get(cid, 0) + 1
+        if len(batch) == 1 and state.item_failures[batch[0]] >= self.MAX_ITEM_FAILURES:
+            state.pending = [c for c in state.pending if c.comment_id != batch[0]]
+            state.item_failures.pop(batch[0], None)
+            state.quarantined += 1
+            state.batch_limit = None
+            state.failures, state.retry_at = 0, 0.0
+            state.first_pending_ts = state.pending[0].ts if state.pending else None
+            logger.error(
+                "reducer quarantined a comment that cannot be embedded session=%s", session_id
+            )
+        elif state.failures >= 2 and len(batch) > 1:
+            state.batch_limit = max(1, len(batch) // 2)
+        self._prune(state, session_id)
+
+    def _prune(self, state: _SessionState, session_id: str) -> None:
+        """Keep cache only for recent demand/pending; provenance for everything still
+        referenced (pending or a live cluster member) so decisions keep their source ids."""
+        pending_ids = {c.comment_id for c in state.pending} | state.inflight
+        cache_ids = {d["comment_id"] for d in state.demand} | pending_ids
+        state.cache = {cid: entry for cid, entry in state.cache.items() if cid in cache_ids}
+        store = self._stores.get(session_id)
+        live = pending_ids | (store.live_member_ids() if store is not None else set())
+        state.provenance = {cid: rec for cid, rec in state.provenance.items() if cid in live}
 
     # ------------------------------------------------------------------
     # Reconciliation (5.5-5.6) — invoked by the caller when due; never on the
@@ -366,6 +577,7 @@ class FastReducer:
             self._reconcile_split_total.get(session_id, 0) + result.split
         )
         self._last_reconcile[session_id] = result
+        self._observe_membership(session_id, store, now)
         return result
 
     # ------------------------------------------------------------------
@@ -402,9 +614,12 @@ class FastReducer:
                 return
             state = self._sessions[session_id]
             state.wake_event.clear()
+            waiter = asyncio.ensure_future(state.wake_event.wait())
             try:
-                await asyncio.wait_for(state.wake_event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
+                done, _ = await asyncio.wait({waiter}, timeout=remaining)
+            finally:
+                waiter.cancel()
+            if not done:
                 return
 
     async def run_loop(self) -> None:
@@ -423,7 +638,13 @@ class FastReducer:
             for session_id in list(self._sessions):
                 deadline = self.pending_deadline(session_id, now)
                 if deadline is not None and deadline <= now:
-                    await self.run_once(session_id, now)
+                    try:
+                        await self.run_once(session_id, now)
+                    except Exception:
+                        state = self._sessions.get(session_id)
+                        if state is not None:
+                            self._note_failure(state, session_id, now)
+                        logger.exception("reducer batch deferred session=%s", session_id)
                     drained = True
             if drained:
                 continue
@@ -439,10 +660,16 @@ class FastReducer:
             session_id, deadline = min(pending, key=lambda item: item[1])
             remaining = max(0.0, deadline - now)
             self._any_wake.clear()
+            if remaining == float("inf"):
+                await self._any_wake.wait()
+                continue
+            # asyncio.wait, not wait_for: on Python 3.11 wait_for swallows a cancel that
+            # arrives together with the wake, so Stop/shutdown could hang forever.
+            waiter = asyncio.ensure_future(self._any_wake.wait())
             try:
-                await asyncio.wait_for(self._any_wake.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                continue  # deadline matured; loop drains it
+                await asyncio.wait({waiter}, timeout=remaining)
+            finally:
+                waiter.cancel()
 
     # ------------------------------------------------------------------
     # Observability

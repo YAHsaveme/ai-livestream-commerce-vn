@@ -149,6 +149,12 @@ class _FakeVersionRepo:
         # into the stored row (mirrors the SQL INSERT-ONLY repository).
         self.rows[version.id] = version.model_copy(deep=True)
 
+    async def list_by_item(self, item_id: str, *, conn=None) -> list[ScriptVersion]:
+        return sorted(
+            (v.model_copy(deep=True) for v in self.rows.values() if v.script_item_id == item_id),
+            key=lambda v: v.version,
+        )
+
 
 class _FakeGateRunRepo:
     def __init__(self) -> None:
@@ -1165,3 +1171,47 @@ async def test_recover_orchestrator_rebuilds_from_state() -> None:
     assert persist_queue is not None
     assert bridge is not None
     assert "b1" in service._active_orchestrators
+
+
+@pytest.mark.asyncio
+async def test_one_product_script_is_not_held_to_the_whole_show_minimum() -> None:
+    gate = _FakeGate(_pass_result())
+    service = _make_service(gate)
+    created = await service.create_script_set(
+        name="A", transition_policy="ORDER_AGNOSTIC", product_ids=["P1"], brief=None
+    )
+    await service.save_draft(
+        set_id=created["id"],
+        product_id="P1",
+        display_text="Kem tốt",
+        spoken_text="Kem tốt",
+        revision=None,
+    )
+    await service.submit_for_gate(set_id=created["id"], product_id="P1")
+    assert gate.contexts[-1].total_min_seconds < 10
+
+
+@pytest.mark.asyncio
+async def test_short_product_script_passes_submit_and_approval_with_the_real_gate() -> None:
+    service = _make_service(_FakeGate(_pass_result()))
+    real = service._default_gate()
+    service._gate = real
+    created = await service.create_script_set(
+        name="A", transition_policy="ORDER_AGNOSTIC", product_ids=["P1"], brief=None
+    )
+    text = "Quần kaki. Có nhiều size, chất vải thoáng mát. Đổi size cho bạn nhé."
+    await service.save_draft(
+        set_id=created["id"], product_id="P1", display_text=text, spoken_text=text, revision=None
+    )
+    submitted = await service.submit_for_gate(set_id=created["id"], product_id="P1")
+    assert submitted["state"] == "REVIEWABLE", submitted
+    version_id = (await service._repos.items.get_by_product(created["id"], "P1")).current_version_id
+    approved = await service.approve_product(
+        set_id=created["id"],
+        product_id="P1",
+        version_id=version_id,
+        actor="admin",
+        is_human=True,
+        authorized=True,
+    )
+    assert approved["state"] == "APPROVED"

@@ -12,7 +12,7 @@ from backend.config import AppConfig
 from conftest import make_deps as _Deps  # noqa: F401
 
 
-def _event(event_id: str, text: str = "hello", viewer_id: str = "u1") -> dict:
+def _event(event_id: str, text: str = "Gia bao nhieu?", viewer_id: str = "u1") -> dict:
     return {
         "event_id": event_id,
         "platform": "tiktok",
@@ -68,7 +68,7 @@ def test_events_many_in_one_request() -> None:
         sid = client.post("/api/v1/sessions", json={}).json()["session_id"]
         r = client.post(
             f"/api/v1/sessions/{sid}/events",
-            json={"events": [_event(f"m{i}", text=f"msg {i}") for i in range(10)]},
+            json={"events": [_event(f"m{i}", text=f"San pham {i} gia bao nhieu?") for i in range(10)]},
         )
 
     assert r.status_code == 200

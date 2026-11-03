@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-__all__ = ["SessionLockTimeout", "SessionStore", "StaleOwnerWriteError"]
+__all__ = ["SessionLockTimeout", "SessionStore", "StaleOwnerWriteError", "delete_owned"]
 
 
 class SessionLockTimeout(Exception):
@@ -34,6 +34,21 @@ class StaleOwnerWriteError(Exception):
         self.session_id = session_id
 
 
+async def delete_owned(store: object, session_id: str, fence: object) -> bool:
+    """Delete a session meta only while the caller still owns the lock (``fence``).
+
+    A stale holder whose lease expired must never delete what a newer owner persisted.
+    Without a fence (single-process stores) it is a plain delete. Raises
+    ``StaleOwnerWriteError`` when ownership is lost.
+    """
+    deleter = getattr(store, "delete_if_owner", None)
+    if fence is None or deleter is None:
+        return await store.delete(session_id)  # type: ignore[attr-defined]
+    if not await deleter(fence):
+        raise StaleOwnerWriteError(session_id)
+    return True
+
+
 class SessionStore(ABC):
     """Abstract session storage (async contract)."""
 
@@ -48,6 +63,10 @@ class SessionStore(ABC):
 
     @abstractmethod
     async def exists(self, session_id: str) -> bool: ...
+
+    async def list_session_ids(self) -> list[str]:
+        """Every stored session id (recovery scans only; default none for exotic stores)."""
+        return []
 
     def exists_sync(self, session_id: str) -> bool:
         """Sync convenience for route-layer guards; default False.

@@ -19,6 +19,7 @@ import inspect
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -44,7 +45,18 @@ def _start_reducer_loop(container: BootstrapContainer) -> None:
     reducer = getattr(container, "reducer", None)
     if reducer is None:
         return
-    container.reducer_loop_task = asyncio.create_task(reducer.run_loop(), name="reducer-loop")
+
+    async def supervise():
+        while True:
+            try:
+                await reducer.run_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("reducer worker failed; restarting")
+            await asyncio.sleep(1.0)
+
+    container.reducer_loop_task = asyncio.create_task(supervise(), name="reducer-loop")
 
 
 async def _stop_reducer_loop(container: BootstrapContainer) -> None:
@@ -124,6 +136,292 @@ async def _connect_postgres(container: BootstrapContainer) -> None:
                 delay,
             )
             await asyncio.sleep(delay)
+
+
+async def _start_terminal_outcomes(container: BootstrapContainer) -> None:
+    """P0-FB-019 (DISABLED slice): wire the durable terminal record and outbox.
+
+    Inert unless TERMINAL_OUTCOMES_ENABLED is set AND a connected Postgres store,
+    an https (or loopback) callback URL and a secret exist. Only then is the
+    ``execution.terminal.v1`` capability advertised; any failure leaves it absent
+    so the API keeps the legacy path.
+    """
+    from backend.application.execution_contract import set_terminal_advertised
+    from backend.application.terminal_outcomes import (
+        TerminalOutbox,
+        TerminalOutcomes,
+        TerminalSettings,
+    )
+
+    settings = TerminalSettings.from_env()
+    if not settings.enabled:
+        return
+    pg = container.pg_store
+    if not settings.configured or pg is None or not getattr(pg, "enabled", False):
+        logger.error("Terminal outcomes enabled but not configured; capability stays absent")
+        return
+    try:
+        await pg.apply_terminal_schema()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Terminal outcomes schema failed error_type=%s; capability stays absent",
+            type(exc).__name__,
+        )
+        return
+    container.terminal_outcomes = TerminalOutcomes(pg)
+    container.terminal_outbox_task = asyncio.create_task(
+        TerminalOutbox(pg, settings).run_loop(), name="terminal-outbox"
+    )
+    set_terminal_advertised(True)
+
+
+async def _start_usage_evidence(container: BootstrapContainer) -> None:
+    """P0-FB-017: wire the durable signed usage-evidence outbox and background sender.
+
+    Fail closed: inert unless USAGE_EVIDENCE_ENABLED AND a connected Postgres store, the
+    exact receiver URL and a secret exist. Only then is ``usage.evidence.v1`` advertised;
+    any failure leaves it absent and no row is ever written.
+    """
+    from backend.application.execution_contract import set_usage_evidence_capabilities
+    from backend.application.usage_evidence import UsageEvidence, UsageSender
+    from backend.application.usage_evidence.outbox import UsageOutbox
+    from backend.application.usage_evidence.settings import UsageEvidenceSettings
+
+    settings = UsageEvidenceSettings.from_env()
+    if not settings.enabled:
+        return
+    pg = container.pg_store
+    if not settings.configured or pg is None or not getattr(pg, "enabled", False):
+        logger.error("Usage evidence enabled but not configured; capability stays absent")
+        return
+    try:
+        await pg.apply_usage_evidence_schema()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Usage evidence schema failed error_type=%s; capability stays absent",
+            type(exc).__name__,
+        )
+        return
+    outbox = UsageOutbox(pg, producer_id=settings.producer_id)
+    service = UsageEvidence(outbox, settings)
+    await _enable_cost_evidence(pg, settings)
+    from backend.api.v1.execution import _locked
+
+    sender = UsageSender(
+        outbox,
+        settings,
+        session_store=container.store,
+        session_lock=lambda session_id: _locked(container.store, session_id),
+        cogs=service.cogs,
+        unstaged_sessions=service.unstaged_sessions,
+    )
+    container.usage_evidence = service
+    container.usage_sender = sender
+    container.usage_evidence_task = asyncio.create_task(sender.run_loop(), name="usage-evidence")
+    set_usage_evidence_capabilities(settings.capabilities())
+
+
+async def _enable_cost_evidence(pg: Any, settings: Any) -> None:
+    """M7.3: cost producer only if flagged AND the outbox CHECK was widened by the operator job."""
+    from backend.application.usage_evidence.cost import cost_meter
+
+    cost_meter.configure(enabled=False)
+    if not settings.cost_enabled:
+        return
+    try:
+        ready = await pg.usage_cost_event_type_ready()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Cost evidence check failed error_type=%s; producer stays off", type(exc).__name__
+        )
+        return
+    if not ready:
+        logger.error(
+            "Cost evidence enabled but usage_evidence_outbox CHECK is not widened; run "
+            "backend.application.usage_evidence.cost_migration once. Producer stays off"
+        )
+        return
+    cost_meter.configure(enabled=True, buffer=settings.cost_buffer)
+
+
+async def _stop_usage_evidence(container: BootstrapContainer) -> None:
+    """Stop after the coordinator and before Postgres closes, with a bounded final flush."""
+    from backend.application.execution_contract import set_usage_evidence_capabilities
+
+    set_usage_evidence_capabilities(())
+    from backend.application.usage_evidence.cost import cost_meter
+
+    # render.stop_all may have outlived its stage timeout (it runs in a thread): give its
+    # avatar settle a short bounded moment before the final flush.
+    for _ in range(30):
+        if cost_meter.open_count() == 0:
+            break
+        await asyncio.sleep(0.1)
+    task = getattr(container, "usage_evidence_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    sender = getattr(container, "usage_sender", None)
+    if sender is not None:
+        service = getattr(container, "usage_evidence", None)
+        timeout = service.settings.flush_timeout if service is not None else 5.0
+        try:
+            await sender.flush(timeout)
+        finally:
+            await sender.close()
+    cost_meter.close()  # only after the final flush (and the avatar settle before it)
+    # The service object stays: a request during shutdown still stages durably, and
+    # the rows are delivered by the next process.
+
+
+async def _persist_terminal_on_shutdown(container: BootstrapContainer) -> None:
+    """P0-FB-019: before any component stops, give every unterminated P0 execution a
+    durable record (or an explicit audited deferral). No-op while disabled."""
+    terminal = getattr(container, "terminal_outcomes", None)
+    if terminal is not None:
+        deferred = set()
+        monitor = getattr(container, "runtime_failures", None)
+        if monitor is not None:
+            from backend.api.v1.execution import run_with_deadline
+
+            # The worker has stopped, but an accepted fault must still precede
+            # shutdown's durable terminal decision. Every attempt is bounded.
+            for sid, pending in tuple(monitor.pending.items()):
+                if pending.kind != "terminal":
+                    continue
+                result = {"saved": False}
+
+                async def promote(session_id=sid, item=pending, outcome=result):
+                    try:
+                        outcome["saved"] = await monitor._record(session_id, item)
+                    except Exception as exc:
+                        logger.warning(
+                            "shutdown failure evidence retry session=%s class=%s",
+                            session_id,
+                            type(exc).__name__,
+                        )
+
+                await run_with_deadline(promote(), monitor.settings.attempt_timeout)
+                if not result["saved"]:
+                    deferred.add(sid)
+        extra = set(getattr(container, "orchestrators", {}) or {})
+        publishers = getattr(container, "livekit_publishers", None)
+        extra.update(getattr(publishers, "session_ids", ()) or ())
+        if deferred:
+            await terminal.persist_active_on_shutdown(
+                container.store, tuple(extra), deferred_session_ids=frozenset(deferred)
+            )
+        else:
+            await terminal.persist_active_on_shutdown(container.store, tuple(extra))
+
+
+async def _stop_terminal_outcomes(container: BootstrapContainer) -> None:
+    from backend.application.execution_contract import set_terminal_advertised
+
+    set_terminal_advertised(False)
+    task = getattr(container, "terminal_outbox_task", None)
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _start_budget_lease(container: BootstrapContainer) -> None:
+    """P0-FB-018 S6: expiry watcher, only when LIVE_CREDIT_LEASE_ENFORCEMENT is on.
+
+    Wiring and advertising are one step: ``budget.lease.v1`` appears only once the
+    watcher task exists, and the route answers 409 until then.
+    """
+    from backend.application import budget_lease
+
+    settings = budget_lease.LeaseSettings.from_env()
+    if not settings.enabled:
+        return
+    enforcer = budget_lease.BudgetLeaseEnforcer(container, settings)
+    container.budget_lease_enforcer = enforcer
+    await enforcer.rehydrate()  # persisted expiries gate admission before any traffic
+    container.budget_lease_task = asyncio.create_task(enforcer.run_loop(), name="budget-lease")
+    budget_lease.set_active(True)
+
+
+async def _stop_budget_lease(container: BootstrapContainer) -> None:
+    from backend.application import budget_lease
+
+    budget_lease.set_active(False)
+    task = getattr(container, "budget_lease_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _start_runtime_failures(container: BootstrapContainer) -> None:
+    from backend.application.runtime_failures import FailureSettings, RuntimeFailures
+
+    settings = FailureSettings.from_env()
+    if not settings.enabled:
+        return
+    if container.coordinator is None or container.approved_speech is None:
+        raise RuntimeError("runtime failure detection requires coordinator and speech gate")
+    if container.terminal_outcomes is None:
+        raise RuntimeError("runtime failure detection requires durable terminal outcomes")
+    service = RuntimeFailures(container, settings)
+    container.runtime_failures = service
+    container.coordinator.runtime_failures = service
+    container.runtime_failures_task = asyncio.create_task(
+        service.run_loop(), name="runtime-failures"
+    )
+
+
+async def _stop_runtime_failures(container: BootstrapContainer) -> None:
+    service = getattr(container, "runtime_failures", None)
+    if service is None:
+        return
+    if container.coordinator is not None:
+        container.coordinator.runtime_failures = None
+    task = container.runtime_failures_task
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    for flush in tuple(service.flush_tasks):
+        flush.cancel()
+    await asyncio.gather(*tuple(service.flush_tasks), return_exceptions=True)
+
+
+def _start_avatar_lifecycle(container: BootstrapContainer) -> None:
+    from backend.application.avatar_lifecycle import AvatarLifecycle
+    from backend.application.clients.avatar.lemonslice import LemonSliceRenderBackend
+
+    if isinstance(container.backend, LemonSliceRenderBackend):
+        service = AvatarLifecycle(container, container.config.runtime_ready_ttl_s)
+        container.avatar_lifecycle_task = asyncio.create_task(
+            service.run_loop(), name="avatar-lifecycle"
+        )
+
+
+async def _stop_avatar_lifecycle(container: BootstrapContainer) -> None:
+    task = getattr(container, "avatar_lifecycle_task", None)
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def _connect_authoring(container: BootstrapContainer) -> None:
@@ -214,16 +512,21 @@ async def _recover_authoring(container: BootstrapContainer) -> None:
 # -- Shutdown --------------------------------------------------------
 
 
-async def _call_cleanup(operation, *, async_method: bool = False) -> None:
-    """Run one cleanup callable, tolerating sync/async boundaries."""
+async def _call_cleanup(operation, *, async_method: bool = False):
+    """Run one cleanup callable, tolerating sync/async boundaries.
+
+    Returns the callable's result: a teardown that hands back work to audit
+    (coordinator ``stop_all`` -> delivery fences) must not lose it here.
+    """
     if async_method:
         result = operation()
         if inspect.isawaitable(result):
-            await result
-        return
+            return await result
+        return result
     result = await asyncio.to_thread(operation)
     if inspect.isawaitable(result):
-        await result
+        return await result
+    return result
 
 
 async def _call_orchestrators(container: BootstrapContainer) -> None:
@@ -270,11 +573,40 @@ async def _shutdown(container: BootstrapContainer) -> None:
             )
 
     async def stop_coordinator() -> None:
+        """Stop every session, then audit the routed work they were holding.
+
+        A process shutdown has no per-session ``/stop`` route to reconcile on,
+        so it takes the fences ``stop_all`` returns and reconciles them here —
+        the same "caller passes the fence to reconcile_session" contract the
+        route uses. Without this, routed comments die with the queues and no
+        audit row is ever written (P0-FB-013 silent loss).
+        """
         coordinator = getattr(container, "coordinator", None)
-        if coordinator is not None:
-            stop_all = getattr(coordinator, "stop_all", None)
-            if stop_all is not None:
-                await _call_cleanup(stop_all, async_method=inspect.iscoroutinefunction(stop_all))
+        if coordinator is None:
+            return
+        stop_all = getattr(coordinator, "stop_all", None)
+        if stop_all is None:
+            return
+        fences = await _call_cleanup(stop_all, async_method=inspect.iscoroutinefunction(stop_all))
+        ingestion = getattr(container, "event_ingestion", None)
+        if ingestion is None:
+            return
+        for session_id, attach_seq in (fences or {}).items():
+            try:
+                reconciled = await ingestion.reconcile_session(session_id, attach_seq=attach_seq)
+            except Exception as exc:
+                logger.error(
+                    "Shutdown reconciliation failed session=%s error_type=%s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                continue
+            if reconciled:
+                logger.info(
+                    "shutdown reconciled non-deliverable events session=%s count=%d",
+                    session_id,
+                    len(reconciled),
+                )
 
     async def stop_session_pipeline() -> None:
         """Cancel any active orchestrator tasks so no producer outlives."""
@@ -349,11 +681,20 @@ async def _shutdown(container: BootstrapContainer) -> None:
     # close stages so no owned task races the pool close (HIGH-1).
     await drain_authoring()
     stages = (
+        ("avatar.lifecycle", lambda: _stop_avatar_lifecycle(container)),
+        ("runtime.failures", lambda: _stop_runtime_failures(container)),
+        # First: a stopping process must not turn its own teardown into control_lost.
+        ("budget.lease", lambda: _stop_budget_lease(container)),
+        ("terminal.shutdown", lambda: _persist_terminal_on_shutdown(container)),
         ("orchestrators", stop_session_pipeline),
         ("coordinator", stop_coordinator),
         ("reducer", lambda: _stop_reducer_loop(container)),
+        ("terminal.outbox", lambda: _stop_terminal_outcomes(container)),
         ("livekit.stop_all", stop_livekit),
+        # render.stop_all settles still-open avatar cost records; usage evidence flushes them
+        # into the outbox only after that, then turns the meter off.
         ("render.stop_all", stop_backend),
+        ("usage.evidence", lambda: _stop_usage_evidence(container)),
         ("clients.close", close_clients),
         ("authoring", close_authoring),
         ("postgres", close_postgres),
@@ -374,7 +715,12 @@ def build_lifespan(container: BootstrapContainer):
             await _connect_postgres(container)
             await _connect_authoring(container)
             await _recover_authoring(container)
+            await _start_terminal_outcomes(container)
+            await _start_usage_evidence(container)
             _start_reducer_loop(container)
+            await _start_budget_lease(container)
+            await _start_runtime_failures(container)
+            _start_avatar_lifecycle(container)
         except Exception:
             # Production startup is fail-fast: tear down any partially
             # initialized resource before the boot error propagates.

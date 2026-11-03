@@ -88,6 +88,7 @@ def _raise_domain(service_error: ScriptAuthoringError) -> HTTPException:
         "stale_revision",
         "fix_not_eligible",
         "missing_or_stale_script",
+        "idempotency_conflict",
     ):
         return _domain_error(409, service_error.code, service_error.message)
     if service_error.code == "llm_unavailable":
@@ -153,6 +154,22 @@ class DraftIn(BaseModel):
     revision: int | None = Field(default=None, ge=0)
 
 
+class DraftPartIn(BaseModel):
+    """One displayed part; ``segment_id`` is empty for a part the owner just added."""
+
+    part_id: str | None = Field(default=None, max_length=128)
+    segment_id: str | None = Field(default=None, max_length=128)
+    display_text: str = Field(min_length=1, max_length=200_000)
+
+
+class DraftPartsIn(BaseModel):
+    """Structured save: the exact ordered parts the owner sees (never a source claim)."""
+
+    expected_version_id: str = Field(min_length=1, max_length=128)
+    parts: list[DraftPartIn] = Field(min_length=1, max_length=200)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class GenerationPreviewReq(BaseModel):
     """No-LLM preview of planned work (Decision 11)."""
 
@@ -172,6 +189,11 @@ class RegenerateReq(BaseModel):
     """Explicit human action: regenerate one segment as a new immutable version."""
 
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_version_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # Stable part identity; preferred over the path index, which is only a compatibility key.
+    part_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # Owner's explicit choice for a legacy part whose brief was never stored.
+    intent: Literal["recap", "intro"] | None = None
 
 
 class FixReq(BaseModel):
@@ -192,6 +214,11 @@ class BatchGenerateReq(BaseModel):
     product_ids: list[str] = Field(default_factory=list, max_length=200)
     target_duration_s: int = Field(ge=60, le=7_200)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    # True = write the whole set in the owner's order as short ordered parts (units):
+    # opening, per product intro/selling points/offer/trust/CTA, closing. Empty
+    # ``product_ids`` then means every product of the set.
+    ordered_units: bool = False
+    replace_existing: bool = False
 
 
 class ApproveBatchReq(BaseModel):
@@ -323,6 +350,31 @@ async def put_draft(
     return result
 
 
+@_router.put("/script-sets/{set_id}/products/{product_id}/draft-parts")
+async def put_draft_parts(
+    set_id: str,
+    product_id: str,
+    req: DraftPartsIn,
+    request: Request,
+    _: None = Depends(viewer_auth),
+) -> dict[str, Any]:
+    """Structured save keeping each unchanged part's identity and provenance."""
+    service = _service(request)
+    try:
+        result = await service.save_draft_parts(
+            set_id=set_id,
+            product_id=product_id,
+            parts=[p.model_dump() for p in req.parts],
+            expected_version_id=req.expected_version_id,
+            idempotency_key=req.idempotency_key,
+        )
+    except ScriptAuthoringError as exc:
+        raise _raise_domain(exc) from exc
+    if result is None:
+        raise _domain_error(404, "not_found", f"script set {set_id} not found")
+    return result
+
+
 @_router.post("/script-sets/{set_id}/products/{product_id}/submit")
 async def submit_for_gate(
     set_id: str,
@@ -401,6 +453,18 @@ async def generate_product(
     return result
 
 
+@_router.get("/script-sets/{set_id}/products/{product_id}/workflows/{workflow_id}")
+async def workflow_status(
+    set_id: str, product_id: str, workflow_id: str, request: Request, _: None = Depends(viewer_auth)
+) -> dict:
+    try:
+        return await _service(request).get_workflow(
+            set_id=set_id, product_id=product_id, workflow_id=workflow_id
+        )
+    except ScriptAuthoringError as exc:
+        raise _raise_domain(exc) from exc
+
+
 @_router.post(
     "/script-sets/{set_id}/products/{product_id}/segments/{segment_index}/regenerate",
     status_code=status.HTTP_202_ACCEPTED,
@@ -426,6 +490,9 @@ async def regenerate_segment(
             product_id=product_id,
             segment_index=segment_index,
             idempotency_key=key,
+            **({"expected_version_id": req.expected_version_id} if req.expected_version_id else {}),
+            **({"part_id": req.part_id} if req.part_id else {}),
+            **({"intent": req.intent} if req.intent else {}),
         )
     except ScriptAuthoringError as exc:
         raise _raise_domain(exc) from exc
@@ -520,6 +587,9 @@ async def generate_batch(
             product_ids=list(req.product_ids),
             target_duration_s=req.target_duration_s,
             idempotency_key=key,
+            # Only sent when asked for, so a service without the option keeps working.
+            **({"ordered_units": True} if req.ordered_units else {}),
+            **({"replace_existing": True} if req.replace_existing else {}),
         )
     except ScriptAuthoringError as exc:
         raise _raise_domain(exc) from exc

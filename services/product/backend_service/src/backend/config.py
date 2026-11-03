@@ -7,7 +7,7 @@ the whole refactor completes.
 
 Engine selection (the production seam):
   RENDER_BACKEND   cloud_liveavatar | self_host_avatarforcing_half |
-                   self_host_echoavatar_full | mock
+                   self_host_echoavatar_full | static_avatar (free test avatar) | mock
   SESSION_STORE    memory(Colab) | redis(AWS)
   LLM_ENGINE       vllm | llamacpp | sglang | hf | openai_compat | none(default echo)
   TTS_ENGINE       transformers(default) | vieneu | cosyvoice | tone |
@@ -25,10 +25,44 @@ symbols (``BASE_SALE_PERSONA``).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
+
+
+def _timer_env(name: str, default: str) -> float:
+    """Finite, non-negative float from the environment (0 = explicit disable where documented).
+
+    A negative/NaN/inf value would silently disable a safeguard, so it is refused by name.
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a finite, non-negative number") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite, non-negative number")
+    return value
+
+
+def _positive_timer_env(name: str, default: str) -> float:
+    value = _timer_env(name, default)
+    if value <= 0:
+        raise ValueError(f"{name} must be a finite, positive number")
+    return value
+
+
+def _int_env(name: str, default: str, minimum: int = 0) -> int:
+    """Strict integer from the environment; errors name the variable and never echo the value."""
+    try:
+        value = int(os.environ.get(name, default))
+    except ValueError:
+        raise ValueError(f"{name} must be an integer >= {minimum}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
 
 
 def _dsn_is_loopback(database_url: str) -> bool:
@@ -138,6 +172,8 @@ def _resolve_adapter_defaults(env: dict[str, str]) -> dict[str, str | None]:
         key = avatar_adapter.lower()
         if key in ("liveavatar", "baidu_xiling"):
             render_backend = "cloud_liveavatar"
+        elif key == "lemonslice":
+            render_backend = "cloud_lemonslice"
         elif key == "self_hosted":
             render_backend = None  # self-host rendering is avatar_service's domain
         else:
@@ -175,7 +211,7 @@ class LLMConfig:
     stream: bool = False  # LLM_STREAM=1 -> emit TextChunks via stream_chunks()
     base_url: str = ""  # remote OpenAI-compat endpoint (LLM_BASE_URL)
     guided_json: bool = False  # LLM_GUIDED_JSON / outlines structured output
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)  # may carry credentials
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
@@ -277,7 +313,7 @@ class TTSConfig:
     ref_audio: Optional[str] = None
     preset_id: str = "vieneu-v3-turbo"
     base_url: str = ""  # remote TTS service URL (TTS_BASE_URL)
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)  # carries the TTS api_key
 
     @classmethod
     def from_env(cls) -> "TTSConfig":
@@ -385,6 +421,12 @@ class ScriptAuthoringConfig:
     # job/batch row is fenced to its owning replica before another
     # replica's ``recover_pending`` may re-claim it.
     recovery_lease_seconds: int = 300
+    # Ordered-units generation bounds: transport attempts per LLM call, wall-clock
+    # per call, and for the whole batch job (afterwards every remaining unit fails
+    # fast and the owner finishes the script by hand).
+    unit_llm_attempts: int = 2
+    unit_llm_call_timeout_s: float = 60.0
+    unit_job_deadline_s: float = 900.0
 
     def lease_heartbeat_interval(self) -> float:
         """Bounded heartbeat cadence for owned provider calls (R8.3).
@@ -425,8 +467,8 @@ class PublishingConfig:
     """LiveKit publishing settings — credentials stay server-side."""
 
     livekit_url: str = ""
-    livekit_api_key: str = ""
-    livekit_api_secret: str = ""
+    livekit_api_key: str = field(default="", repr=False)
+    livekit_api_secret: str = field(default="", repr=False)
     room_ttl_sec: int = 3600
     fps: int = 25
 
@@ -461,7 +503,7 @@ class AppConfig:
 
     # Session storage
     store_backend: str = "memory"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = field(default="redis://localhost:6379/0", repr=False)  # may embed a password
 
     # CORS
     cors_origins: str = "*"
@@ -497,8 +539,8 @@ class AppConfig:
     director_enabled: bool = False
 
     # Auth tokens (Task 7). Empty + app_env="dev" -> auth disabled.
-    backend_api_token: str = ""  # viewer token: /lite/* + /ws/control
-    admin_api_token: str = ""  # admin token: /engines/* + /debug/*
+    backend_api_token: str = field(default="", repr=False)  # viewer: /lite/* + /ws/control
+    admin_api_token: str = field(default="", repr=False)  # admin: /engines/* + /debug/*
 
     # Debug mode gate (Task 7). When False, /debug/* -> 404.
     debug_enabled: bool = False
@@ -506,17 +548,46 @@ class AppConfig:
     # Remote service URLs (AWS multi-service; empty offline)
     avatar_base_url: str = ""
     livekit_url: str = ""
-    livekit_api_key: str = ""
-    livekit_api_secret: str = ""
+    livekit_api_key: str = field(default="", repr=False)
+    livekit_api_secret: str = field(default="", repr=False)
     lmcache_enabled: bool = False
     # Pipecat orchestration toggle (full wiring is another agent). Default off.
     pipecat_enabled: bool = False
     # Director coverage match threshold (speech vs key_selling_points)
     coverage_match_threshold: float = 0.75
     # Optional Postgres runtime (Wave D). Empty = store disabled.
-    database_url: str = ""
+    database_url: str = field(default="", repr=False)  # DSN embeds the password
     # Backend audio publish to LiveKit SFU (stub until SDK wired).
     livekit_publish: bool = False
+    # cloud_lemonslice (P0-FB-010). Empty/off by default; see clients/avatar/lemonslice.py.
+    # static_avatar: still image + TTS in LiveKit, no provider (testing only).
+    static_avatar_image: str = ""
+    static_avatar_width: int = 1280
+    static_avatar_height: int = 720
+    static_avatar_fps: int = 10
+    static_avatar_sample_rate: int = 24000
+    lemonslice_api_key: str = field(default="", repr=False)
+    lemonslice_api_base: str = "https://lemonslice.com/api/liveai"
+    lemonslice_agent_id: str = ""
+    lemonslice_avatar_allowlist: str = ""
+    avatar_image_hosts: str = ""
+    avatar_internal_token: str = field(default="", repr=False)
+    lemonslice_audio_sample_rate: int = 16000
+    lemonslice_idle_timeout_s: int = 60
+    lemonslice_speak_ready_gate_enabled: bool = True
+    lemonslice_speak_ready_wait_s: float = 45.0
+    lemonslice_ready_timeout_s: float = 30.0
+    lemonslice_avatar_identity: str = "lemonslice-avatar-agent"
+    lemonslice_terminate_path: str = "sessions/{session_id}/control"
+    lemonslice_keepalive_s: float = 20.0
+    lemonslice_max_session_s: float = 1500.0
+    lemonslice_rollover_after_s: float = 0.0
+    lemonslice_control_deadline_s: float = 15.0
+    runtime_ready_ttl_s: float = 1200.0
+    lemonslice_daily_avatar_minutes: float = 0.0
+    lemonslice_payment_backoff_s: float = 3600.0
+    avatar_audio_fallback_publish: bool = False
+    avatar_render_offset_ms: int = 0
 
     # Engine configs
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -586,7 +657,7 @@ class AppConfig:
             director_enabled=os.environ.get("DIRECTOR_ENABLED", "0").lower()
             in ("1", "true", "yes"),
             backend_api_token=os.environ.get("BACKEND_API_TOKEN", ""),
-            admin_api_token=os.environ.get("ADMIN_API_TOKEN", ""),
+            admin_api_token=os.environ.get("ADMIN_API_TOKEN", "").strip(),
             debug_enabled=os.environ.get("DEBUG_ENABLED", "0").lower()
             in ("1", "true", "on", "yes"),
             avatar_base_url=os.environ.get("AVATAR_BASE_URL", ""),
@@ -601,6 +672,46 @@ class AppConfig:
             database_url=os.environ.get("DATABASE_URL", ""),
             livekit_publish=os.environ.get("LIVEKIT_PUBLISH", "0").lower()
             in ("1", "true", "on", "yes"),
+            static_avatar_image=os.environ.get("STATIC_AVATAR_IMAGE", ""),
+            static_avatar_width=_int_env("STATIC_AVATAR_WIDTH", "1280", 16),
+            static_avatar_height=_int_env("STATIC_AVATAR_HEIGHT", "720", 16),
+            static_avatar_fps=_int_env("STATIC_AVATAR_FPS", "10", 1),
+            static_avatar_sample_rate=_int_env("STATIC_AVATAR_SAMPLE_RATE", "24000", 8000),
+            lemonslice_api_key=os.environ.get("LEMONSLICE_API_KEY", ""),
+            lemonslice_api_base=os.environ.get("LEMONSLICE_API_BASE")
+            or "https://lemonslice.com/api/liveai",
+            lemonslice_agent_id=os.environ.get("LEMONSLICE_AGENT_ID", ""),
+            lemonslice_avatar_allowlist=os.environ.get("LEMONSLICE_AVATAR_ALLOWLIST", ""),
+            avatar_image_hosts=os.environ.get("AVATAR_IMAGE_HOSTS", ""),
+            avatar_internal_token=os.environ.get("AVATAR_INTERNAL_TOKEN", ""),
+            lemonslice_audio_sample_rate=_int_env("LEMONSLICE_AUDIO_SAMPLE_RATE", "16000", 1),
+            lemonslice_idle_timeout_s=_int_env("LEMONSLICE_IDLE_TIMEOUT_S", "60"),
+            lemonslice_speak_ready_gate_enabled=os.environ.get(
+                "LEMONSLICE_SPEAK_READY_GATE_ENABLED", "true"
+            )
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
+            lemonslice_speak_ready_wait_s=_timer_env("LEMONSLICE_SPEAK_READY_WAIT_S", "45"),
+            lemonslice_ready_timeout_s=_timer_env("LEMONSLICE_READY_TIMEOUT_S", "30"),
+            lemonslice_avatar_identity=os.environ.get("LEMONSLICE_AVATAR_IDENTITY")
+            or "lemonslice-avatar-agent",
+            lemonslice_terminate_path=os.environ.get("LEMONSLICE_TERMINATE_PATH")
+            or "sessions/{session_id}/control",
+            lemonslice_keepalive_s=_timer_env("LEMONSLICE_KEEPALIVE_S", "20"),
+            runtime_ready_ttl_s=_timer_env("RUNTIME_READY_TTL_S", "1200"),
+            lemonslice_daily_avatar_minutes=_timer_env("LEMONSLICE_DAILY_AVATAR_MINUTES", "0"),
+            lemonslice_payment_backoff_s=_positive_timer_env("LEMONSLICE_CREDIT_BACKOFF_S", "3600"),
+            lemonslice_max_session_s=_timer_env("LEMONSLICE_MAX_SESSION_S", "1500"),
+            lemonslice_rollover_after_s=_timer_env("LEMONSLICE_ROLLOVER_AFTER_S", "0"),
+            lemonslice_control_deadline_s=_positive_timer_env(
+                "LEMONSLICE_CONTROL_DEADLINE_S", "15"
+            ),
+            avatar_audio_fallback_publish=os.environ.get(
+                "AVATAR_AUDIO_FALLBACK_PUBLISH", "0"
+            ).lower()
+            in ("1", "true", "on", "yes"),
+            avatar_render_offset_ms=_int_env("AVATAR_RENDER_OFFSET_MS", "0"),
             llm=llm_cfg,
             tts=tts_cfg,
             script_authoring=ScriptAuthoringConfig.from_env(),
@@ -632,6 +743,12 @@ class AppConfig:
             and not self.redis_url.startswith("rediss://")
         ):
             raise ValueError("production redis requires rediss:// (TLS)")
+        from backend.application.execution_contract import rescue_switch_on
+
+        if rescue_switch_on() and not self.admin_api_token.strip():
+            raise ValueError(
+                "LIVENTO_P0_RESCUE_COMMANDS requires ADMIN_API_TOKEN (internal cleanup)"
+            )
         if (
             self.is_production
             and self.database_url
@@ -677,6 +794,10 @@ class AppConfig:
                 width=self.mock_avatar_width,
                 height=self.mock_avatar_height,
             )
+        if self.render_backend == "cloud_lemonslice":
+            return self._build_lemonslice_backend()
+        if self.render_backend == "static_avatar":
+            return self._build_static_avatar_backend()
         if self.render_backend in (
             "cloud_liveavatar",
             "self_host_avatarforcing_half",
@@ -718,8 +839,106 @@ class AppConfig:
             return _RemoteBackend()
         raise ValueError(
             "unknown RENDER_BACKEND "
-            f"{self.render_backend!r}; expected cloud_liveavatar, "
-            "self_host_avatarforcing_half, self_host_echoavatar_full, or mock"
+            f"{self.render_backend!r}; expected cloud_liveavatar, cloud_lemonslice, "
+            "self_host_avatarforcing_half, self_host_echoavatar_full, static_avatar, or mock"
+        )
+
+    def _build_static_avatar_backend(self):
+        """A free stand-in avatar; refused in production so it can never go live by accident."""
+        if self.is_production:
+            raise ValueError("static_avatar is for testing only; refused in production")
+        missing = [
+            name
+            for name, value in (
+                ("LIVEKIT_URL", self.livekit_url),
+                ("LIVEKIT_API_KEY", self.livekit_api_key),
+                ("LIVEKIT_API_SECRET", self.livekit_api_secret),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("static_avatar requires " + ", ".join(missing))
+        if self.livekit_publish:
+            raise ValueError("static_avatar refuses LIVEKIT_PUBLISH=true (double audio)")
+        from backend.application.clients.avatar.static_avatar import (
+            StaticAvatarRenderBackend,
+            StaticAvatarSettings,
+        )
+
+        return StaticAvatarRenderBackend(
+            StaticAvatarSettings(
+                livekit_url=self.livekit_url,
+                livekit_api_key=self.livekit_api_key,
+                livekit_api_secret=self.livekit_api_secret,
+                avatar_identity=self.lemonslice_avatar_identity,
+                image_path=self.static_avatar_image,
+                width=self.static_avatar_width,
+                height=self.static_avatar_height,
+                fps=self.static_avatar_fps,
+                audio_sample_rate=self.static_avatar_sample_rate,
+            )
+        )
+
+    def _build_lemonslice_backend(self):
+        """Fail loud on missing credentials or a second audio publisher (double audio)."""
+        missing = [
+            name
+            for name, value in (
+                ("LIVEKIT_URL", self.livekit_url),
+                ("LIVEKIT_API_KEY", self.livekit_api_key),
+                ("LIVEKIT_API_SECRET", self.livekit_api_secret),
+                ("LEMONSLICE_API_KEY", self.lemonslice_api_key),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("cloud_lemonslice requires " + ", ".join(missing))
+        if self.livekit_publish:
+            # The legacy publisher would publish raw TTS beside the avatar (double
+            # audio, lip desync). The flagged fallback owns its own delayed track.
+            raise ValueError(
+                "cloud_lemonslice refuses LIVEKIT_PUBLISH=true: the avatar is the "
+                "only audio source (use AVATAR_AUDIO_FALLBACK_PUBLISH for video-only avatars)"
+            )
+        from backend.application.clients.avatar.lemonslice import (
+            LemonSliceRenderBackend,
+            LemonSliceSettings,
+        )
+
+        return LemonSliceRenderBackend(
+            LemonSliceSettings(
+                livekit_url=self.livekit_url,
+                livekit_api_key=self.livekit_api_key,
+                livekit_api_secret=self.livekit_api_secret,
+                lemonslice_api_key=self.lemonslice_api_key,
+                api_base=self.lemonslice_api_base,
+                agent_id=self.lemonslice_agent_id,
+                avatar_allowlist=tuple(
+                    a.strip() for a in self.lemonslice_avatar_allowlist.split(",") if a.strip()
+                ),
+                image_hosts=tuple(
+                    host.strip().lower()
+                    for host in self.avatar_image_hosts.split(",")
+                    if host.strip()
+                ),
+                audio_sample_rate=self.lemonslice_audio_sample_rate,
+                idle_timeout_s=self.lemonslice_idle_timeout_s,
+                ready_timeout_s=self.lemonslice_ready_timeout_s,
+                speak_ready_gate_enabled=self.lemonslice_speak_ready_gate_enabled,
+                speak_ready_wait_s=self.lemonslice_speak_ready_wait_s,
+                avatar_identity=self.lemonslice_avatar_identity,
+                fallback_publish=self.avatar_audio_fallback_publish,
+                render_offset_ms=self.avatar_render_offset_ms,
+                terminate_path=self.lemonslice_terminate_path,
+                keepalive_s=self.lemonslice_keepalive_s,
+                max_session_s=self.lemonslice_max_session_s,
+                rollover_after_s=self.lemonslice_rollover_after_s,
+                control_deadline_s=self.lemonslice_control_deadline_s,
+                daily_avatar_minutes=self.lemonslice_daily_avatar_minutes,
+                budget_redis_url=self.redis_url,
+                payment_backoff_s=self.lemonslice_payment_backoff_s,
+                ready_ttl_s=self.runtime_ready_ttl_s,
+            )
         )
 
     def build_llm_engine(self):

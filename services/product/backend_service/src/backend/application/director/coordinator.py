@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import time
@@ -35,31 +36,55 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+from backend.application.reducer.fast_reducer import source_lag_ms
 from backend.application.entity.models import EntityDocument
 
 from .comment_buffer import ChatQueue, IncomingComment
+from .errors import CoordinatorUnavailable
 from .clustering import Comment, cluster_comments
 from .decision import Decision, Director
 from .embeddings import embedder_status
 from .hooks import HookPool
-from .config import StreamConfig
+from .config import DEFLECTION_INTERVAL_SEC, StreamConfig
 from .scoring import rank_clusters
 from .session_context import DirectorRuntime
 from .routing import route_comment
 from .state import StreamState
 
+from backend.application.live_follow import LiveFollowRecorder
 from backend.application.render.locks import SessionLockRegistry
 from backend.application.render.queue import BoundedVideoQueue, CoordinatorMetrics
 
-from ..render.orchestrator import StreamOrchestrator, StreamingControllerConfig
+from backend.application.clients.tts.self_hosted import TTSClientError
+from ..render.orchestrator import (
+    AvatarDeliveryUnconfirmed,
+    StreamOrchestrator,
+    StreamingControllerConfig,
+)
+from ..clients.avatar.lemonslice import LemonSliceError
 from ..text_chunker import FixedChunkPolicyConfig
+from ..script_authoring.approved_speech import SpeechRejected
 
 if TYPE_CHECKING:
     # The hub is only used through its async ``emit(session_id, event)``
     # method, so the import stays lazy (TYPE_CHECKING) to avoid cycles.
     from backend.api.v1.hub import ControlHub
+    from backend.application.runtime_failures import RuntimeFailures
 
 logger = logging.getLogger(__name__)
+
+# A rejected `close` (no approved closing at P0) leaves the Director in CLOSING with nothing
+# spoken, so every tick would re-issue the same close decision; a rejected answer likewise leaves
+# its cluster selectable, so it is re-decided every tick and every retry calls the LLM. After a
+# rejection, suppress the same `close` / the same answer cluster for this long, doubling per
+# consecutive rejection.
+CLOSE_REJECT_BACKOFF_SEC = 5.0
+CLOSE_REJECT_BACKOFF_MAX_SEC = 60.0
+
+# A slow or stuck /ws/control subscriber must never stall a Director turn: one hub emit may take
+# at most this long.
+HUB_EMIT_TIMEOUT_SEC = 2.0
+AVATAR_UNIT_RETRIES = 2
 
 
 def _decision_to_event(decision: Decision) -> dict:
@@ -87,6 +112,13 @@ class _SessionStats:
     skips: int = 0
     interrupts: int = 0
     last_decision_ts: Optional[float] = None
+    last_turn_end: Optional[float] = None  # monotonic end of the previous spoken turn
+
+
+def _decision_to_start_ms(decision: "Decision", playback_started: float):
+    """Milliseconds from the Director deciding the turn to its audio starting (queue wait + preparation + boundary)."""
+    decided = (decision.latency_spans.get("decision") or {}).get("start")
+    return "na" if decided is None else int((playback_started - decided) * 1000)
 
 
 class DirectorCoordinator:
@@ -119,7 +151,18 @@ class DirectorCoordinator:
         pg_store: Any = None,
         audio_window_callback: Any = None,
         completed_history_size: int = 10,
+        reducer: Any = None,
+        session_store: Any = None,
+        engine_manager: Any = None,
     ) -> None:
+        self._session_store = session_store
+        self._voice_lookup_timeout_s = 1.5
+        self._voice_cache: dict[str, str | None] = {}
+        self._voice_rejected: set[str] = set()
+        # Per-session generation token: stop() drops it so late callbacks of a stopped
+        # (or restarted) session never write back into the cache.
+        self._voice_gen: dict[str, object] = {}
+        self._engine_manager = engine_manager
         self._runtime = runtime
         # Factory inputs for building a FRESH StreamOrchestrator + queue +
         # metrics per _maybe_speak() call. Sharing one orchestrator across
@@ -142,6 +185,9 @@ class DirectorCoordinator:
         # (tests that do not exercise MJPEG).
         self._orchestrator_registry = orchestrator_registry
         self._queues: dict[str, ChatQueue] = {}
+        # Per-session count of comments routed into the queue. Fences teardown
+        # reconciliation against stale reports (P0-FB-013).
+        self._delivery_seq: dict[str, int] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._playback_tasks: dict[str, asyncio.Task] = {}
         self._prepare_tasks: dict[str, set[asyncio.Task]] = {}
@@ -150,26 +196,158 @@ class DirectorCoordinator:
         self._stats: dict[str, _SessionStats] = {}
         self._active_score: dict[str, float] = {}
         self._last_tick: dict[str, float] = {}
+        self._resume_count: dict[str, int] = {}
         self._decision_queue: dict[str, deque[Decision]] = {}
         self._speech_queue: dict[str, deque[Decision]] = {}
         self._current_speech: dict[str, Decision] = {}
+        # Popped by the playback loop, not speaking yet (revalidation await): in neither queue.
+        self._popped: dict[str, Decision] = {}
         self._completed_speech: dict[str, dict] = {}
         self._completed_history: dict[str, deque[dict]] = {}
         self._completed_history_size = completed_history_size
         self._activated: set[str] = set()
+        self._autonomous_openings: dict[str, str] = {}
+        # (session, "close" | "answer:<cluster>") -> (consecutive rejections, monotonic not-before)
+        self._backoff: dict[tuple[str, str], tuple[int, float]] = {}
+        self._backoff_members: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._monotonic = time.monotonic
+        self._last_deflection_started: dict[str, float] = {}
+        self._social: dict = {}
+        self._social_ids: dict[str, dict[str, float]] = {}
+        self._social_admitted: dict[str, dict[str, float]] = {}
+        self._opening_media: dict[str, dict] = {}
         # Optional Postgres runtime store (durable rows). None/disabled -> no
         # persistence. Fire-and-forget: a failure must never break the speak loop.
         self._pg_store = pg_store
         self._audio_window_callback = audio_window_callback
+        # Sink for "these queued comments were really read out of the queue".
+        # The app composition root points it at
+        # PlatformEventIngestionService.mark_consumed so a comment the tick
+        # consumed is not reconciled as lost at teardown (P0-FB-013). One
+        # unbound callable keeps the ingress ledger out of this module.
+        self.comment_consumed = None
+        # The app composition root installs the same boundary used by /say.
+        self.approved_speech = None
+        self.runtime_failures: RuntimeFailures | None = None  # wired by default-off 020 lifespan
+        # The bounded FastReducer (P0-FB-014). One instance serves all sessions;
+        # it is consulted ONLY for sessions in reducer mode, so a legacy session
+        # is byte-for-byte unchanged.
+        self._reducer = reducer
+        # Live-follow facts (position + comment outcomes). Inert unless
+        # RUNTIME_LIVE_FOLLOW_EVENTS_ENABLED is on; its emit never blocks speech.
+        self.live_follow = LiveFollowRecorder(emit=self._emit)
+        self._wire_live_follow()
+        # Per-session decision-input mode. True = the reducer is the only
+        # viewer-demand input; False/absent = the legacy raw-comment feed.
+        # Runtime engineering selector, NOT a Product Rule.
+        self._reducer_mode: set[str] = set()
+        self._tts_failures: dict[str, int] = {}  # consecutive TTS/empty-audio failures
+        # Sessions whose 013 truthful-outcome opt-in actually fired. Reducer
+        # mode refuses to decide for a session that is not in here.
+        self._reducer_ready: set[str] = set()
+        # Bounded per-session consumed-id marker, used ONLY in reducer mode
+        # (the legacy path marks consumption via state.embeddings_cache).
+        self._reducer_consumed: dict[str, dict[str, float]] = {}
+
+    # ------------------------------------------------------------------
+    # Decision-input mode (P0-FB-014)
+    # ------------------------------------------------------------------
+
+    @property
+    def reducer(self):
+        return self._reducer
+
+    @reducer.setter
+    def reducer(self, value) -> None:
+        self._reducer = value
+        self._wire_live_follow()
+
+    def _wire_live_follow(self) -> None:
+        if self._reducer is not None and self.live_follow.enabled:
+            self._reducer.membership_observer = self._on_membership
+
+    def _on_membership(self, session_id: str, store, now: float, *, force: bool = True) -> None:
+        if session_id not in self._tasks or session_id not in self._reducer_mode:
+            return
+        reducer = self._reducer
+        self.live_follow.sync_membership(
+            session_id,
+            store.membership(),
+            lambda comment_id: reducer.comment_provenance(session_id, comment_id),
+            now=now,
+            horizon_sec=store.config.rolling_horizon_sec,
+            force=force,
+        )
+
+    def _live_follow_tick(self, session_id: str, ds) -> None:
+        """Per-tick observation: hold/closing facts and age-based membership expiry."""
+        if not self.live_follow.enabled:
+            return
+        blocked = self.approved_speech.blocked(session_id) if self.approved_speech else None
+        self.live_follow.hold(session_id, ds, "held" if blocked == "held" else None)
+        if blocked == "closing":
+            self.live_follow.close_pending(session_id, "session_closing")
+        elif blocked == "ending":
+            self.live_follow.close_pending(session_id, "session_closed")
+        store = self._reducer.session_store(session_id) if self._reducer is not None else None
+        if store is not None:
+            self._on_membership(session_id, store, time.time(), force=False)
+
+    def live_follow_snapshot(self, session_id: str) -> Optional[dict]:
+        """Bounded current live-follow state, or None when the session is not attached."""
+        ds = self._runtime._sessions.get(session_id)
+        if ds is None or session_id not in self._tasks:
+            return None
+        store = self._reducer.session_store(session_id) if self._reducer is not None else None
+        if store is not None:
+            self._on_membership(session_id, store, time.time(), force=True)
+        return self.live_follow.snapshot(session_id, ds)
+
+    def set_reducer_mode(self, session_id: str, enabled: bool = True) -> None:
+        """Select the decision input for one session.
+
+        Reducer mode requires the 013 truthful-outcome opt-in to be ACTIVE for
+        that session. ``mark_reducer_ready`` records that opt-in at consumption
+        time; until then ``_reducer_store`` returns None and the session
+        decides nothing — a refusal, never a silent fallback to the legacy feed.
+        """
+        if enabled:
+            self._reducer_mode.add(session_id)
+        else:
+            self._reducer_mode.discard(session_id)
+
+    def reducer_mode(self, session_id: str) -> bool:
+        return session_id in self._reducer_mode
+
+    def mark_reducer_ready(self, session_id: str) -> None:
+        """Record that the 013 truthful-outcome opt-in is live for this session.
+
+        Called from the consumption boundary, which is the only place that can
+        observe the opt-in actually firing. Reducer mode refuses until this.
+        """
+        self._reducer_ready.add(session_id)
+
+    def _reducer_store(self, session_id: str):
+        """The session's ClusterStore, or None when reducer mode may not decide."""
+        if session_id not in self._reducer_mode or self._reducer is None:
+            return None
+        if session_id not in self._reducer_ready:
+            return None
+        return self._reducer.session_store(session_id)
 
     async def _emit(self, session_id: str, event: dict) -> None:
         """Send a WS event via the ControlHub if one is wired. No-op otherwise."""
         if self._hub is None:
             return
         try:
-            await self._hub.emit(session_id, event)
-        except Exception:
-            logger.debug("hub.emit failed for %s", session_id, exc_info=True)
+            await asyncio.wait_for(self._hub.emit(session_id, event), HUB_EMIT_TIMEOUT_SEC)
+        except Exception as exc:  # incl. TimeoutError; never the event payload
+            logger.warning(
+                "hub emit failed session=%s event=%s error=%s",
+                session_id,
+                event.get("type"),
+                type(exc).__name__,
+            )
 
     def _register_speaking(
         self, session_id: str, orchestrator: StreamOrchestrator, queue: BoundedVideoQueue
@@ -229,6 +407,7 @@ class DirectorCoordinator:
             self._runtime.attach(session_id, products, cfg=cfg, hooks=hooks)
 
         self._queues[session_id] = ChatQueue(session_id)
+        self.live_follow.begin(session_id)
         self._decision_queue[session_id] = deque()
         self._speech_queue[session_id] = deque()
         self._prepare_tasks[session_id] = set()
@@ -236,6 +415,14 @@ class DirectorCoordinator:
         self._playback_events[session_id] = asyncio.Event()
         self._completed_history[session_id] = deque(maxlen=self._completed_history_size)
         self._stats[session_id] = _SessionStats()
+        # A NEW generation starts from an empty reducer session (P0-FB-014).
+        # ``stop`` already drops it, but a start on a never-stopped id (or a
+        # reattach after a crash) must not inherit the previous generation's
+        # clusters, answered state or provenance either.
+        if self._reducer is not None:
+            self._reducer.drop_session(session_id)
+        self._reducer_consumed.pop(session_id, None)
+        self._reducer_ready.discard(session_id)
         if activated:
             self._activated.add(session_id)
         try:
@@ -252,13 +439,33 @@ class DirectorCoordinator:
             name=f"coordinator-playback-{session_id}",
         )
 
-    def stop(self, session_id: str) -> None:
+    def stop(self, session_id: str) -> int:
         """Cancel the tick task, drop the queue, detach runtime.
 
         If the orchestrator is currently speaking for this session, cancel it.
         Idempotent.
+
+        Returns the delivery counter as of teardown. The caller passes it to
+        ``PlatformEventIngestionService.reconcile_session(session_id,
+        attach_seq=...)`` so comments that were routed but never consumed are
+        reconciled as audited non_deliverable instead of dying with the queue
+        (P0-FB-013). The counter is captured BEFORE the state is dropped.
         """
+        if self.approved_speech is not None:
+            self.approved_speech.cancel(session_id)
+            self.approved_speech.block(session_id, None)
+        attach_seq = self._delivery_seq.get(session_id, 0)
         current = self._current_speech.get(session_id)
+        self.live_follow.close_pending(session_id, "session_closed")
+        if current is not None:
+            self.live_follow.turn_ended(
+                session_id,
+                current,
+                self._runtime._sessions.get(session_id),
+                status="cancelled",
+                reason="session_stopped",
+            )
+        self.live_follow.retire(session_id)
         if current is not None:
             current.is_cancelled = True
         tasks = [
@@ -269,6 +476,12 @@ class DirectorCoordinator:
         for task in tasks:
             if task is not None and not task.done():
                 task.cancel()
+        if self.approved_speech is not None:
+            self.approved_speech.cleanup(session_id)
+        self._tts_failures.pop(session_id, None)
+        self._voice_cache.pop(session_id, None)
+        self._voice_rejected.discard(session_id)
+        self._voice_gen.pop(session_id, None)
         entry = (
             self._orchestrator_registry.get(session_id)
             if self._orchestrator_registry is not None
@@ -278,24 +491,50 @@ class DirectorCoordinator:
             asyncio.create_task(entry["orchestrator"].cancel(session_id))
 
         self._queues.pop(session_id, None)
+        self._delivery_seq.pop(session_id, None)
         self._decision_queue.pop(session_id, None)
         self._speech_queue.pop(session_id, None)
         self._decision_locks.pop(session_id, None)
         self._playback_events.pop(session_id, None)
         self._current_speech.pop(session_id, None)
+        self._popped.pop(session_id, None)
         self._completed_speech.pop(session_id, None)
         self._completed_history.pop(session_id, None)
         self._stats.pop(session_id, None)
         self._active_score.pop(session_id, None)
         self._last_tick.pop(session_id, None)
+        self._resume_count.pop(session_id, None)
         self._activated.discard(session_id)
+        self._autonomous_openings.pop(session_id, None)
+        for key in [k for k in self._backoff if k[0] == session_id]:
+            del self._backoff[key]
+            self._backoff_members.pop(key, None)
+        self._opening_media.pop(session_id, None)
+        self._last_deflection_started.pop(session_id, None)
+        self._social.pop(session_id, None)
+        self._social_ids.pop(session_id, None)
+        self._social_admitted.pop(session_id, None)
         self._runtime.detach(session_id)
         self._lock_registry.drop(session_id)
+        # Drop the reducer's per-session state too (P0-FB-014): clusters,
+        # answered state and provenance must not survive into a new generation
+        # of the same session id.
+        if self._reducer is not None:
+            self._reducer.drop_session(session_id)
+        self._reducer_mode.discard(session_id)
+        self._reducer_ready.discard(session_id)
+        self._reducer_consumed.pop(session_id, None)
+        return attach_seq
 
-    def stop_all(self) -> None:
-        """Cancel every active coordinator session."""
-        for session_id in list(self._tasks):
-            self.stop(session_id)
+    def stop_all(self) -> dict[str, int]:
+        """Cancel every active coordinator session.
+
+        Returns each session's delivery fence as of its teardown, the same
+        value ``stop`` hands back. A caller that bulk-stops (process
+        shutdown) needs it for every session, otherwise routed work dies
+        with the queues and is never audited (P0-FB-013).
+        """
+        return {session_id: self.stop(session_id) for session_id in list(self._tasks)}
 
     def update_catalog(self, session_id: str, products: list[EntityDocument]) -> None:
         """Refresh catalog and invalidate work created before Re-attach."""
@@ -309,10 +548,53 @@ class DirectorCoordinator:
         self._invalidate_queued(session_id, reason="config_revision")
         return result
 
+    @staticmethod
+    def _backoff_key(decision: Decision) -> str | None:
+        if decision.action == "close":
+            return "close"
+        if decision.action in ("answer_cluster", "answer_fact"):
+            ident = decision.source_cluster_id or "|".join(decision.cluster_member_ids)
+            return f"answer:{ident}" if ident else None
+        return None
+
+    def _backed_off(self, session_id: str, decision: Decision) -> bool:
+        key = self._backoff_key(decision)
+        until = self._backoff.get((session_id, key or ""), (0, 0.0))[1]
+        return key is not None and self._monotonic() < until
+
+    def _note_rejected(self, session_id: str, decision: Decision) -> None:
+        """Back off after a rejected `close` / answer: not re-decided (and re-prompted) every tick."""
+        key = self._backoff_key(decision)
+        if key is None:
+            return
+        count = self._backoff.get((session_id, key), (0, 0.0))[0] + 1
+        delay = CLOSE_REJECT_BACKOFF_SEC
+        for _ in range(count - 1):
+            delay = min(delay * 2, CLOSE_REJECT_BACKOFF_MAX_SEC)
+            if delay == CLOSE_REJECT_BACKOFF_MAX_SEC:
+                break
+        self._backoff[(session_id, key)] = (count, self._monotonic() + delay)
+        if decision.cluster_member_ids and decision.source_cluster_id is None:
+            self._backoff_members[(session_id, key)] = decision.cluster_member_ids
+
+    def _skip_response(self, session_id: str, decision: Decision, reason: str) -> None:
+        self.live_follow.skip_response(session_id, decision, reason)
+        self._record_cancelled(session_id, decision, reason)
+        ds = self._runtime._sessions.get(session_id)
+        if ds is not None:
+            ds.director.state.skipped_comments.update(decision.cluster_member_ids)
+
     def _record_cancelled(self, session_id: str, decision: Decision, reason: str) -> None:
         if decision.is_cancelled:
             return
         decision.is_cancelled = True
+        self.live_follow.turn_ended(
+            session_id,
+            decision,
+            self._runtime._sessions.get(session_id),
+            status="cancelled",
+            reason=reason,
+        )
         if session_id not in self._stats or not self._runtime.has(session_id):
             return
         cancelled = {
@@ -345,6 +627,8 @@ class DirectorCoordinator:
 
     async def interrupt(self, session_id: str) -> str:
         """Cancel active playback and invalidate every queued/prepared turn."""
+        if self.approved_speech is not None:
+            self.approved_speech.cancel(session_id)
         token = self._runtime.invalidate_generation(session_id)
         current = self._current_speech.get(session_id)
         if current is not None:
@@ -360,6 +644,55 @@ class DirectorCoordinator:
         await asyncio.to_thread(self._backend.interrupt, session_id)
         return token
 
+    # -- P0-FB-016 Hold / closing start fence ---------------------------------
+    def _frozen(self, session_id: str) -> bool:
+        """Held, closing or ending: ingest continues, no new turn starts."""
+        return self.approved_speech is not None and bool(self.approved_speech.blocked(session_id))
+
+    def _hard_expired(self, session_id: str, decision: Decision) -> bool:
+        """Q&A older than the hard-expiry horizon by its original comment time."""
+        ds = self._runtime._sessions.get(session_id)
+        if ds is None or decision.action not in ("answer_cluster", "answer_fact"):
+            return False
+        # ponytail: the Director selection window is the hard-expiry horizon
+        # (exact windows REQUIRES_VALIDATION); swap in the validated value.
+        newest = decision.occurred_at_bounds[1]
+        if session_id in self._reducer_mode and newest > 0:
+            # Reducer provenance is wall-clock occurred_at; Director comments
+            # use seconds since attach. Never mix these clocks on resume.
+            return time.time() - newest > ds.director.cfg.selection_window_sec
+        seen = {c.id: c.t for c in ds.director.state.rolling_comments}
+        times = [seen[i] for i in decision.cluster_member_ids if i in seen]
+        # Unknown (pruned) members are older than the window: fail closed.
+        return not times or ds.now() - max(times) > ds.director.cfg.selection_window_sec
+
+    TTS_MAX_CONSECUTIVE_FAILURES = 3
+
+    def resume(self, session_id: str) -> list[str]:
+        """Re-check queued Q&A age before anything plays; called after unblock.
+
+        Hard expiry is measured from each member comment's original time
+        (BR-QA-002: delay does not reset age). Envelope/content revalidation
+        runs again at ``_maybe_speak`` before any queued turn starts.
+        """
+        expired = []
+        self._resume_count[session_id] = self._resume_count.get(session_id, 0) + 1
+        ds = self._runtime._sessions.get(session_id)
+        if ds is not None:
+            for queue in (self._decision_queue.get(session_id), self._speech_queue.get(session_id)):
+                if queue is None:
+                    continue
+                for decision in list(queue):
+                    if self._hard_expired(session_id, decision):
+                        queue.remove(decision)
+                        self._record_cancelled(session_id, decision, "hard_expired")
+                        expired.append(decision.turn_id)
+            self._last_tick[session_id] = ds.now()
+        event = self._playback_events.get(session_id)
+        if event is not None:
+            event.set()
+        return expired
+
     def ingest(
         self,
         session_id: str,
@@ -373,10 +706,67 @@ class DirectorCoordinator:
         """
         queue = self._queues.get(session_id)
         if queue is None:
-            raise KeyError(f"No active coordinator session: {session_id}")
+            raise CoordinatorUnavailable(f"No active coordinator session: {session_id}")
+        self._delivery_seq[session_id] = self._delivery_seq.get(session_id, 0) + 1
         comment = queue.put(text, author, ts=ts)
-        self._activated.add(session_id)
+        if ts is not None:
+            # How old the comment already was on arrival: the Facebook -> API -> Runtime part of the answer delay.
+            logger.info(
+                "comment ingested session=%s source_lag_ms=%s",
+                session_id,
+                source_lag_ms(ts),
+            )
+        # Approved P0 sessions require the authorized execution start command.
+        if self._runtime.get_session(session_id).approved_envelope is None:
+            self._activated.add(session_id)
         return comment
+
+    def activate_approved(self, session_id: str, opening_turn_id: str, envelope) -> None:
+        """Queue exactly one locked opening; called under the execution lock."""
+        if session_id in self._autonomous_openings:
+            return
+        ds = self._runtime.get_session(session_id)
+        if not self.has(session_id) or ds.approved_envelope != envelope:
+            raise SpeechRejected("session_not_attached")
+        product = envelope.products[0]
+        decision = Decision(
+            action="autonomous_opening",
+            stage="opening",
+            task_id="approved-opening",
+            turn_id=opening_turn_id,
+            product_id=product.product_id,
+            prepared_script=product.units[0],
+            unit_index=0,
+            revision_token=self._runtime.current_generation_token(session_id),
+        )
+        self._autonomous_openings[session_id] = opening_turn_id
+        self._activated.add(session_id)
+        self._decision_queue[session_id].append(decision)
+        task = asyncio.create_task(self._prepare_turn(session_id, decision))
+        self._prepare_tasks[session_id].add(task)
+        task.add_done_callback(
+            lambda done: self._prepare_tasks.get(session_id, set()).discard(done)
+        )
+
+    def opening_media(self, session_id: str) -> dict | None:
+        return self._opening_media.get(session_id)
+
+    async def _record_opening_media(
+        self, session_id: str, decision: Decision, utterance_id: str, speech
+    ) -> None:
+        if (
+            self._autonomous_openings.get(session_id) == decision.turn_id
+            and self._speech_live(session_id, decision)
+            and speech is not None
+        ):
+            receipt = {
+                "opening_turn_id": decision.turn_id,
+                "media_utterance_id": utterance_id,
+                "approved_envelope_hash": speech.envelope.fingerprint,
+            }
+            if session_id not in self._opening_media:
+                self._opening_media[session_id] = receipt
+                await self._emit(session_id, {"type": "execution.opening_media", **receipt})
 
     @staticmethod
     def _speech_item(decision: Decision, state: str = "queued") -> dict:
@@ -514,6 +904,16 @@ class DirectorCoordinator:
         }
         return result
 
+    def question_facts(self, session_id: str) -> list[str]:
+        """Approved product context for the cheap intake eligibility check."""
+        ds = self._runtime._sessions.get(session_id)
+        if ds is None or ds.approved_envelope is None:
+            return []
+        return [
+            str(json.loads(product.facts_json).get("product_name") or "")
+            for product in ds.approved_envelope.products
+        ]
+
     def cluster_snapshot(self, session_id: str) -> dict:
         """Return the exact active cluster set used by the session Director."""
         queue = self._queues.get(session_id)
@@ -539,7 +939,8 @@ class DirectorCoordinator:
             item.cluster
             for item in ranked
             if not any(
-                member_id in state.answered_comments for member_id in item.cluster.member_ids
+                member_id in (state.answered_comments | state.skipped_comments)
+                for member_id in item.cluster.member_ids
             )
         ]
         status = embedder_status(ds.embedder)
@@ -578,6 +979,30 @@ class DirectorCoordinator:
         """True if a coordinator session is active for this session_id."""
         return session_id in self._tasks
 
+    def queue_capacity(self, session_id: str) -> int:
+        """Free slots left in the session's ChatQueue; 0 when full.
+
+        ``ChatQueue.put`` evicts the oldest comment once it exceeds
+        ``max_size``, so a producer must be able to ask for headroom BEFORE
+        putting or it silently drops someone else's comment (P0-FB-013).
+        An unknown session is 0 — there is nowhere to put the comment.
+        """
+        queue = self._queues.get(session_id)
+        if queue is None:
+            return 0
+        return queue.free_slots()
+
+    def next_delivery_tick(self, session_id: str | None = None) -> int:
+        """Monotonic count of comments routed through the session's queue.
+
+        Read by the ingress service to fence teardown reconciliation: a
+        delivery stamped with a counter above the teardown's was routed
+        after it and must not be reconciled (P0-FB-013).
+        """
+        if session_id is None:
+            return sum(self._delivery_seq.values())
+        return self._delivery_seq.get(session_id, 0)
+
     def _advance_timers(self, session_id: str, now: float, state: StreamState) -> None:
         """Increment all three elapsed counters by delta since last tick."""
         prev = self._last_tick.get(session_id, now)
@@ -600,13 +1025,22 @@ class DirectorCoordinator:
                 await asyncio.sleep(tick_sec)
                 try:
                     await self._tick_once(session_id)
+                    if self.runtime_failures is not None:
+                        self.runtime_failures.tick(session_id, None)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    logger.exception(
-                        "coordinator tick error for session %s (continuing)",
-                        session_id,
-                    )
+                except Exception as exc:
+                    if self.runtime_failures is not None:
+                        logger.error(
+                            "coordinator tick error session=%s class=%s",
+                            session_id,
+                            type(exc).__name__,
+                        )
+                        self.runtime_failures.tick(session_id, exc)
+                    else:
+                        logger.exception(
+                            "coordinator tick error for session %s (continuing)", session_id
+                        )
         except asyncio.CancelledError:
             logger.debug("coordinator tick loop cancelled for %s", session_id)
 
@@ -620,18 +1054,66 @@ class DirectorCoordinator:
             return
         director: Director = ds.director
         state: StreamState = director.state
-        embedder = self._get_embedder()
+        self._live_follow_tick(session_id, ds)
+        social = self._social.get(session_id)
+        if social is not None and social.pending is not None:
+            from backend.application.platform_events.social_reply import enabled
+
+            if not enabled() or self._monotonic() - social.pending.created >= 15:
+                self._social_decision(session_id, ds)  # settle expired/disabled, never speak
         fresh = queue.drain_window(self._cfg.window_sec)
+        if session_id in self._reducer_mode:
+            # Reducer mode (P0-FB-014): the bounded reducer is the only
+            # viewer-demand input. The queue is still drained and the
+            # consumption boundary still fires (I-4) — but this coordinator
+            # does NOT embed, route, or add to rolling_comments, so the raw
+            # decision feed is off for this session. The reducer, fed at
+            # consumption by the ingress service, owns the clustering.
+            #
+            # Nothing is added to embeddings_cache here, so the per-session
+            # consumed set is what makes a comment consumed exactly once.
+            new_only = [
+                comment for comment in fresh if comment.id not in self._consumed_ids(session_id)
+            ]
+            # Release ChatQueue capacity exactly as the legacy path does (013).
+            queue.mark_consumed(c.id for c in new_only)
+            if self.comment_consumed is not None and new_only:
+                try:
+                    self.comment_consumed(session_id, {c.id for c in new_only})
+                except Exception:
+                    logger.warning(
+                        "consumed-comment sink failed session=%s", session_id, exc_info=True
+                    )
+            self._remember_consumed(session_id, new_only)
+            now = ds.now()
+            if self._frozen(session_id):
+                # Hold freezes Director timers and scheduling, not ingestion.
+                self._last_tick[session_id] = now
+                return
+            self._advance_timers(session_id, now, state)
+            await self._fill_prepared(session_id)
+            return
+        embedder = self._get_embedder()
         new_only = [comment for comment in fresh if comment.id not in state.embeddings_cache]
-        if new_only:
-            vecs = await asyncio.to_thread(embedder.encode, [comment.text for comment in new_only])
-            for comment, vector in zip(new_only, vecs):
+        new_comments = [
+            comment
+            for comment in new_only
+            if comment.id not in self._social_ids.get(session_id, {})
+        ]
+        for comment in new_only:
+            if comment.id in self._social_ids.get(session_id, {}):
+                state.embeddings_cache[comment.id] = []  # consumption marker, never demand
+        if new_comments:
+            vecs = await asyncio.to_thread(
+                embedder.encode, [comment.text for comment in new_comments]
+            )
+            for comment, vector in zip(new_comments, vecs):
                 state.embeddings_cache[comment.id] = list(vector)
         director_now = ds.now()
         wall_now = time.time()
         routed = []
         current = state.current_product()
-        for incoming in new_only:
+        for incoming in new_comments:
             vector = state.embeddings_cache[incoming.id]
             routed.append(
                 route_comment(
@@ -646,13 +1128,84 @@ class DirectorCoordinator:
                 )
             )
         state.add_comments(routed)
+        queue.mark_consumed(c.id for c in new_only)
+        # This is the consumption boundary: the comments left ChatQueue and
+        # are now Director state, so a teardown must not reconcile them as
+        # non_deliverable (P0-FB-013). Only ``new_only`` counts — a comment
+        # re-read from the window on a later tick was already consumed.
+        if self.comment_consumed is not None and new_only:
+            try:
+                self.comment_consumed(session_id, {c.id for c in new_only})
+            except Exception:
+                logger.warning("consumed-comment sink failed session=%s", session_id, exc_info=True)
         # Bound the old comment/embedding history at write time (5.10): the
         # ClusterStore owns the long-term demand — this state only feeds the
         # Director's selection window.
         state.prune_history(director_now, director.cfg.selection_window_sec)
         now = ds.now()
+        if self._frozen(session_id):
+            # Hold freezes Director timers and scheduling, not ingestion.
+            self._last_tick[session_id] = now
+            return
         self._advance_timers(session_id, now, state)
         await self._fill_prepared(session_id)
+
+    def _consumed_ids(self, session_id: str):
+        """Comment ids already consumed in reducer mode.
+
+        In reducer mode nothing is added to ``state.embeddings_cache``, so that
+        cache cannot double as the consumed marker. A bounded per-session set
+        does: a comment is consumed exactly once (I-4), and a re-read from the
+        window on a later tick is not consumed again.
+        """
+        return self._reducer_consumed.get(session_id, {})
+
+    def _remember_consumed(self, session_id: str, comments) -> None:
+        seen = self._reducer_consumed.setdefault(session_id, {})
+        for comment in comments:
+            seen[comment.id] = comment.ts
+        # A comment older than the drain window can never be re-read, so its
+        # marker is dead weight: prune on the same horizon the queue uses.
+        cutoff = time.time() - self._cfg.window_sec
+        for stale in [cid for cid, ts in seen.items() if ts < cutoff]:
+            del seen[stale]
+
+    def _decide_from_reducer(self, projection: Director, session_id: str, store, now: float):
+        """Decide from the bounded reducer.
+
+        An empty projection still goes through ``decide_from_reducer`` so the
+        protected opening, introduction, proactive selling, pivot and
+        checkpoint logic run exactly as in legacy. Without a ready store the caller
+        decides on an empty rolling window, which agrees with this path.
+        """
+        from .reducer_input import build_selections
+
+        selections = build_selections(
+            projection,
+            store=store,
+            reducer_now=time.time(),
+            director_now=now,
+            wall_now=time.time(),
+            provenance=(
+                None
+                if self._reducer is None
+                else lambda cid: self._reducer.provenance_for(session_id, cid)
+            ),
+        )
+        # Exclude only this rejected cluster BEFORE ranking. Breaking after the
+        # winner is selected would starve lower-ranked questions and sales turns.
+        selections = [
+            selection
+            for selection in selections
+            if self._monotonic()
+            >= self._backoff.get((session_id, f"answer:{selection.envelope.cluster_id}"), (0, 0.0))[
+                1
+            ]
+        ]
+        high_value_ids = projection.high_value_cluster_ids(selections)
+        return projection.decide_from_reducer(
+            selections, now, high_value_ids=high_value_ids.__contains__
+        )
 
     def _projected_director(self, session_id: str) -> Director:
         ds = self._runtime.get_session(session_id)
@@ -663,17 +1216,114 @@ class DirectorCoordinator:
         current = self._current_speech.get(session_id)
         if current is not None and current.turn_id not in completed_ids:
             projection.mark_spoken(current)
+        popped = self._popped.get(session_id)
+        if popped is not None and popped is not current and popped.turn_id not in completed_ids:
+            projection.mark_spoken(popped)  # else the prefetch decides this unit a second time
         for decision in self._decision_queue.get(session_id, ()):
             projection.mark_spoken(decision)
         for decision in self._speech_queue.get(session_id, ()):
             projection.mark_spoken(decision)
+        # Legacy selectors cluster rolling comments themselves. Remove rejected
+        # members from this disposable projection only: never mark the real
+        # Director/reducer state answered or delete comments that were not spoken.
+        blocked_members = {
+            member
+            for key, members in self._backoff_members.items()
+            if key[0] == session_id and self._monotonic() < self._backoff.get(key, (0, 0.0))[1]
+            for member in members
+        }
+        if blocked_members:
+            projection.state.rolling_comments = [
+                comment
+                for comment in projection.state.rolling_comments
+                if comment.id not in blocked_members
+            ]
         return projection
+
+    def mark_social_admitted(self, session_id, event_id):
+        if session_id not in self._tasks:
+            return
+        seen = self._social_admitted.setdefault(session_id, {})
+        now = self._monotonic()
+        for eid in [eid for eid, added in seen.items() if now - added > 120]:
+            del seen[eid]
+        if len(seen) >= 2000:
+            seen.pop(next(iter(seen)))
+        seen[event_id] = now
+
+    def social_was_admitted(self, session_id, event_id):
+        return event_id in self._social_admitted.get(session_id, {})
+
+    def offer_social(self, session_id, intent, comment_id, event_id, viewer, provenance, ts):
+        from backend.application.platform_events.social_reply import SocialQueue
+
+        if session_id not in self._tasks or self.approved_speech is None:
+            return
+        now = self._monotonic()
+        seen = self._social_ids.setdefault(session_id, {})
+        if comment_id in seen:
+            return
+        for cid in [cid for cid, added in seen.items() if now - added > 120]:
+            del seen[cid]
+        if len(seen) >= 2000:
+            seen.pop(next(iter(seen)))
+        seen[comment_id] = now
+        queue = self._social.setdefault(session_id, SocialQueue())
+        from backend.application.platform_events.social_reply import enabled
+
+        reason = (
+            queue.add(intent, comment_id, event_id, viewer, now) if enabled() else "social_disabled"
+        )
+        cluster = f"social:{session_id}:{queue.serial + 1}"
+        self.live_follow.social_received(
+            session_id, comment_id, event_id, provenance, ts, cluster, reason
+        )
+
+    def _social_decision(self, session_id, ds):
+        from backend.application.platform_events.social_reply import enabled
+
+        queue = self._social.get(session_id)
+        if queue is None or queue.pending is None:
+            return None
+        pending = queue.pending
+        # Three seconds to coalesce a burst; expiry/kill-switch still settles
+        # a pending group even while commerce fills every scheduling slot.
+        age = self._monotonic() - pending.created
+        if age < 3 and enabled():
+            return None
+        item, reason = queue.reserve(self._monotonic())
+        decision = Decision(
+            action="social_reply",
+            topic=item.intent,
+            product_id=ds.director.state.current_product().product_id
+            if ds.director.state.current_product()
+            else None,
+            cluster_member_ids=tuple(item.members),
+            source_event_ids=tuple(item.events),
+            source_cluster_id=f"social:{session_id}:{queue.serial}",
+            occurred_at_bounds=(time.time() - age, time.time() - age),
+        )
+        if reason:
+            self.live_follow.skip_response(session_id, decision, reason)
+            return None
+        decision.social_variant = queue.serial - 1
+        decision.social_deadline = item.created + 15
+        return decision
 
     async def _fill_prepared(self, session_id: str) -> None:
         ds = self._runtime._sessions.get(session_id)
-        if ds is None:
+        if ds is None or self._frozen(session_id):
+            return
+        # Finish the sole approved opening before projecting selling turns.
+        if (
+            session_id in self._autonomous_openings
+            and not ds.director.state.cursor.opening_completed
+        ):
             return
         async with self._decision_locks[session_id]:
+            # A Hold can land while waiting for the lock: prepare nothing.
+            if self._frozen(session_id):
+                return
             depth = ds.director.cfg.prepared_turn_depth
             prepared = self._speech_queue[session_id]
             in_preparation = len(self._prepare_tasks[session_id])
@@ -681,12 +1331,34 @@ class DirectorCoordinator:
             if missing == 0:
                 return
             projection = self._projected_director(session_id)
+            store = self._reducer_store(session_id)
             for _ in range(missing):
+                if self._frozen(session_id):  # Hold landed during an earlier emit await
+                    return
                 now = ds.now()
-                decision = projection.decide(projection.state.rolling_comments, now=now)
+                if store is not None:
+                    decision = self._decide_from_reducer(projection, session_id, store, now)
+                else:
+                    # Reducer mode not ready (or legacy): rolling_comments is
+                    # empty in reducer mode, so this is the same empty-demand
+                    # _decide the reducer branch runs - never a raw-comment feed.
+                    decision = projection.decide(projection.state.rolling_comments, now=now)
                 self._stats[session_id].director_cycles += 1
+                self.live_follow.note_tick_skips(session_id, getattr(projection, "tick_skips", ()))
+                # It can wait between script parts, never replace commerce QA,
+                # the protected opening/introduction or closing, and cannot interrupt.
+                if decision.action in ("idle", "skip", "sell_product"):
+                    if not self._decision_queue[session_id] and not any(
+                        d is not None
+                        and d.action in {"answer_fact", "answer_cluster", "social_reply"}
+                        for d in (*prepared, self._current_speech.get(session_id))
+                    ):
+                        decision = self._social_decision(session_id, ds) or decision
                 if decision.action in ("idle", "skip"):
                     self._stats[session_id].skips += 1
+                    break
+                if self._backed_off(session_id, decision):
+                    self._stats[session_id].skips += 1  # a recent close / this answer was rejected
                     break
                 decision.revision_token = self._runtime.current_generation_token(session_id)
                 decision.latency_spans["decision"] = {
@@ -695,6 +1367,19 @@ class DirectorCoordinator:
                 }
                 self._decision_queue[session_id].append(decision)
                 projection.mark_spoken(decision)
+                self.live_follow.turn_selected(session_id, decision, ds)
+                logger.info(
+                    "director decision session=%s turn=%s action=%s product=%s stage=%s unit=%s "
+                    "topic=%s queued_ahead=%d",
+                    session_id,
+                    decision.turn_id,
+                    decision.action,
+                    decision.product_id,
+                    decision.stage,
+                    decision.unit_index,
+                    decision.topic,
+                    len(prepared),
+                )
                 await self._emit(
                     session_id,
                     {"type": "director.decision", **_decision_to_event(decision)},
@@ -725,7 +1410,12 @@ class DirectorCoordinator:
                 await asyncio.sleep(0)
             decision.prompt_layers = self._runtime.prompt_layers(session_id, decision)
             can_prepare = getattr(self._llm, "name", "none") != "none"
-            if decision.prompt is not None and can_prepare:
+            if self.approved_speech is not None:
+                speech = await self._prepare_approved(session_id, decision)
+                decision.approved_speech = speech
+                decision.prepared_script = speech.text
+                decision.prepared_variants = (speech.text,)
+            elif decision.prompt is not None and can_prepare:
                 from .decision_preparation import generate_variants
 
                 variant_count = (
@@ -760,7 +1450,43 @@ class DirectorCoordinator:
         except asyncio.CancelledError:
             self._record_cancelled(session_id, decision, "preparation_cancelled")
             raise
+        except SpeechRejected as exc:
+            logger.warning(
+                "speech rejected session=%s turn=%s action=%s reason=%s",
+                session_id,
+                decision.turn_id,
+                decision.action,
+                exc.code,
+            )
+            if exc.code in {
+                "non_question",
+                "not_answerable_non_commerce",
+                "safety_filtered",
+            } or exc.code.startswith("social_"):
+                self._skip_response(session_id, decision, exc.code)
+            else:
+                self._note_rejected(session_id, decision)
+                self._record_cancelled(session_id, decision, exc.code)
+            if decision.unit_index is not None:
+                # Never let a later unit play ahead of the rejected one.
+                self._invalidate_queued(session_id, reason="unit_rejected")
+            await self._emit(
+                session_id,
+                {
+                    "type": "speech.content_rejected",
+                    "turn_id": decision.turn_id,
+                    "reason": exc.code,
+                },
+            )
         except Exception as exc:
+            if self.runtime_failures is not None:
+                current = self._runtime._sessions.get(session_id)
+                if current is None or (
+                    decision.revision_token and current.generation_token != decision.revision_token
+                ):
+                    self._record_cancelled(session_id, decision, "generation_revision")
+                    return
+                self.runtime_failures.fail(session_id, exc, decision.revision_token)
             decision.is_cancelled = False
             failed = {
                 **self._speech_item(decision, "failed"),
@@ -776,9 +1502,21 @@ class DirectorCoordinator:
                     queue.remove(decision)
                 except ValueError:
                     pass
+            self.live_follow.turn_ended(
+                session_id,
+                decision,
+                self._runtime._sessions.get(session_id),
+                status="failed",
+                reason="preparation_failed",
+            )
             self._activated.discard(session_id)
             self._invalidate_queued(session_id, reason="terminal_preparation_failure")
-            logger.exception("turn preparation failed session=%s", session_id)
+            if self.runtime_failures is not None:
+                logger.error(
+                    "turn preparation failed session=%s class=%s", session_id, type(exc).__name__
+                )
+            else:
+                logger.exception("turn preparation failed session=%s", session_id)
             await self._emit(
                 session_id,
                 {
@@ -796,6 +1534,43 @@ class DirectorCoordinator:
                 except ValueError:
                     pass
 
+    async def _refresh_at_boundary(self, session_id: str) -> bool:
+        """Reconsider prefetched selling text against demand that arrived during playback.
+
+        This runs only between completed turns. The actual cursor has not consumed
+        queued text, so discarding that preparation neither loses nor repeats a unit.
+        The normal Director still owns Q&A cooldowns, relevance and selling fairness.
+        """
+        lock = self._decision_locks.get(session_id)
+        if lock is None:
+            return False
+        async with lock:
+            queue = self._speech_queue.get(session_id)
+            ds = self._runtime._sessions.get(session_id)
+            if (
+                not queue
+                or ds is None
+                or self._frozen(session_id)
+                or queue[0].action
+                not in ("sell_product", "introduce_product", "close", "social_reply")
+                or self._current_speech.get(session_id) is not None
+            ):
+                return False
+            projection = copy.deepcopy(ds.director)
+            store = self._reducer_store(session_id)
+            candidate = (
+                self._decide_from_reducer(projection, session_id, store, ds.now())
+                if store is not None
+                else projection.decide(projection.state.rolling_comments, now=ds.now())
+            )
+            if candidate.action not in ("answer_fact", "answer_cluster") or self._backed_off(
+                session_id, candidate
+            ):
+                return False
+            self._invalidate_queued(session_id, reason="fresh_question_at_boundary")
+        await self._fill_prepared(session_id)
+        return True
+
     async def _playback_loop(self, session_id: str) -> None:
         event = self._playback_events[session_id]
         try:
@@ -803,14 +1578,20 @@ class DirectorCoordinator:
                 await event.wait()
                 event.clear()
                 queue = self._speech_queue.get(session_id)
-                while queue:
+                while queue and not self._frozen(session_id):
+                    if await self._refresh_at_boundary(session_id):
+                        break
                     decision = queue.popleft()
                     if decision.revision_token != self._runtime.current_generation_token(
                         session_id
                     ):
                         self._record_cancelled(session_id, decision, "generation_revision")
                         continue
-                    consumed = await self._maybe_speak(session_id, decision)
+                    self._popped[session_id] = decision
+                    try:
+                        consumed = await self._maybe_speak(session_id, decision)
+                    finally:
+                        self._popped.pop(session_id, None)
                     if not consumed:
                         queue.appendleft(decision)
                         await asyncio.sleep(self._cfg.tick_ms / 1000.0)
@@ -819,6 +1600,124 @@ class DirectorCoordinator:
                     await self._fill_prepared(session_id)
         except asyncio.CancelledError:
             return
+
+    def _speech_live(self, session_id: str, decision: Decision) -> bool:
+        return (
+            not decision.is_cancelled
+            and self._runtime.has(session_id)
+            and decision.revision_token == self._runtime.current_generation_token(session_id)
+        )
+
+    def _social_priority_pending(self, session_id: str) -> bool:
+        ds = self._runtime._sessions.get(session_id)
+        if ds is None:
+            return True
+        projection = copy.deepcopy(ds.director)
+        store = self._reducer_store(session_id)
+        candidate = (
+            self._decide_from_reducer(projection, session_id, store, ds.now())
+            if store is not None
+            else projection.decide(projection.state.rolling_comments, now=ds.now())
+        )
+        return candidate.action in {"answer_fact", "answer_cluster"} and not self._backed_off(
+            session_id, candidate
+        )
+
+    async def _prepare_approved(self, session_id: str, decision: Decision):
+        if decision.action == "social_reply":
+            from backend.application.platform_events.social_reply import SocialPermit
+
+            if self._monotonic() >= decision.social_deadline:
+                raise SpeechRejected("social_expired")
+            return await self.approved_speech.prepare_chitchat(
+                session_id,
+                decision.topic,
+                variant=getattr(decision, "social_variant", 0),
+                product_id=decision.product_id,
+                llm=self._llm,
+                live=lambda: self._speech_live(session_id, decision),
+                permit=SocialPermit(
+                    self._social[session_id],
+                    self._social[session_id].serial,
+                    decision.social_deadline,
+                    self._monotonic,
+                    lambda: self._social_priority_pending(session_id),
+                ),
+            )
+        reactive = decision.action in ("answer_fact", "answer_cluster")
+        refresh_answer = reactive and (
+            decision.prepared_script is None or decision.cache_variant_index is not None
+        )
+        completed_text = ""
+        ds = self._runtime._sessions.get(session_id)
+        if reactive and ds is not None:
+            product = next(
+                (p for p in ds.director.state.products if p.product_id == decision.product_id), None
+            )
+            if product is not None:
+                completed_text = "\n\n".join(product.units[: product.next_unit])
+        return await self.approved_speech.prepare(
+            session_id,
+            (
+                " | ".join(decision.cluster_members[:5])
+                if refresh_answer and decision.cluster_members
+                else decision.prepared_script or decision.prompt or decision.text or ""
+            ),
+            llm=self._llm,
+            generate=refresh_answer
+            or (decision.prompt is not None and decision.prepared_script is None),
+            completed_text=completed_text,
+            question_text=" | ".join(decision.cluster_members[:5]) if refresh_answer else None,
+            product_id=decision.product_id,
+            select_locked=(
+                decision.prepared_script is None
+                and decision.action
+                in (
+                    "introduce_product",
+                    "sell_product",
+                )
+            ),
+            route="director",
+            live=lambda: self._speech_live(session_id, decision),
+        )
+
+    async def _session_tts(self, session_id: str) -> Any:
+        """Default TTS bound to the session's voice_id (store meta), if any.
+
+        The lookup is time-boxed; on timeout/error the last voice read for this session
+        (or the default) is used so a slow store never stalls speech.
+        """
+        if self._session_store is None or self._tts is None:
+            return self._tts
+        if session_id in self._voice_rejected:
+            return self._tts
+        from backend.application.session_tts import wrap_session_tts
+
+        gen = self._voice_gen.setdefault(session_id, object())
+        try:
+            meta = await asyncio.wait_for(
+                self._session_store.get(session_id), self._voice_lookup_timeout_s
+            )
+            if self._voice_gen.get(session_id) is gen:
+                self._voice_cache[session_id] = (meta or {}).get("voice_id")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - voice lookup must never block speech
+            logger.warning(
+                "session voice lookup failed session=%s, using cached/default",
+                session_id,
+                exc_info=True,
+            )
+        return wrap_session_tts(
+            self._tts,
+            self._voice_cache.get(session_id),
+            self._engine_manager,
+            on_reject=lambda: (
+                self._voice_rejected.add(session_id)
+                if self._voice_gen.get(session_id) is gen
+                else None
+            ),
+        )
 
     async def _maybe_speak(self, session_id: str, decision: Decision) -> bool:
         """Attempt to acquire the lock and run the orchestrator for a decision.
@@ -833,15 +1732,101 @@ class DirectorCoordinator:
         if st is None:
             return True
 
+        if decision.action == "social_reply" and self._monotonic() >= decision.social_deadline:
+            self._skip_response(session_id, decision, "social_expired")
+            return True
+
+        speech = None
+        resumed_at_entry = self._resume_count.get(session_id, 0)
+
+        def live():
+            return self._speech_live(session_id, decision)
+
+        if self.approved_speech is not None:
+            try:
+                speech = decision.approved_speech
+                if speech is None:
+                    speech = await self._prepare_approved(session_id, decision)
+                    decision.prepared_script = speech.text
+                    decision.approved_speech = speech
+                if decision.prepared_script != speech.text:
+                    raise SpeechRejected("altered_prepared_text")
+                await self.approved_speech.revalidate(speech, live=live)
+            except SpeechRejected as exc:
+                logger.warning(
+                    "speech rejected session=%s turn=%s action=%s reason=%s",
+                    session_id,
+                    decision.turn_id,
+                    decision.action,
+                    exc.code,
+                )
+                st.skips += 1
+                if exc.code in {
+                    "non_question",
+                    "not_answerable_non_commerce",
+                    "safety_filtered",
+                } or exc.code.startswith("social_"):
+                    self._skip_response(session_id, decision, exc.code)
+                else:
+                    self._note_rejected(session_id, decision)
+                    self._record_cancelled(session_id, decision, exc.code)
+                if decision.unit_index is not None:
+                    self._invalidate_queued(session_id, reason="unit_rejected")
+                await self._emit(
+                    session_id,
+                    {
+                        "type": "speech.content_rejected",
+                        "turn_id": decision.turn_id,
+                        "reason": exc.code,
+                    },
+                )
+                return True
+
+        # Safe speech boundary (P0-FB-016): a held turn stays queued. No await
+        # separates this check from lock acquisition below.
+        if self._frozen(session_id):
+            return False
+        # A Hold->Resume during the revalidation await left this popped turn in
+        # neither queue, so resume() could not expire it: re-check here.
+        if self._resume_count.get(session_id, 0) != resumed_at_entry and self._hard_expired(
+            session_id, decision
+        ):
+            st.skips += 1
+            self._record_cancelled(session_id, decision, "hard_expired")
+            return True
+
         # Playback is serialized. A lock may belong to manual speech or an
         # active backend turn, so never release it from a queued decision.
         if self._lock_registry.is_locked(session_id):
             return False
 
+        # Prepared fallbacks can wait in the queue together: enforce the session
+        # limit here at dispatch, never while preparing or via a topic cooldown.
+        from ..script_authoring.answer_context import is_deflection
+
+        ds = self._runtime._sessions.get(session_id)
+        fallback = decision.action in {"answer_cluster", "answer_fact"} and is_deflection(
+            speech.text if speech is not None else decision.prepared_script or decision.text
+        )
+        if fallback:
+            interval = (
+                ds.director.cfg.deflection_interval_sec
+                if ds is not None
+                else DEFLECTION_INTERVAL_SEC
+            )
+            last = self._last_deflection_started.get(session_id)
+            if last is not None and self._monotonic() - last < interval:
+                st.skips += 1
+                self._skip_response(session_id, decision, "deflection_rate_limited")
+                return True
+
         # 8. Try to acquire the lock.
         ok = self._lock_registry.try_acquire(session_id)
         if not ok:
             return False
+
+        if fallback:
+            self._last_deflection_started[session_id] = self._monotonic()
 
         # Stash the decision score for interrupt comparison.
         decision_score = float(decision.score)
@@ -886,18 +1871,47 @@ class DirectorCoordinator:
 
         queue = BoundedVideoQueue(max_size=self._max_queue_windows)
         metrics = CoordinatorMetrics()
-        orchestrator = StreamOrchestrator(
-            llm=self._llm,
-            tts=self._tts,
-            backend=self._backend,
-            queue=queue,
-            metrics=metrics,
-            fixed_config=self._fixed_config,
-            controller_config=self._controller_config,
-            audio_window_callback=self._audio_window_callback,
-        )
-        self._register_speaking(session_id, orchestrator, queue)
+
+        first_audio_at: list[float] = []
+
+        async def opening_audio(window):
+            if not first_audio_at:
+                self.live_follow.media_started(session_id, decision, ds)
+            first_audio_at.append(time.monotonic())
+            await self._record_opening_media(session_id, decision, window.utterance_id, speech)
+            if self._audio_window_callback is not None:
+                await self._audio_window_callback(window)
+
+        async def avatar_status(waiting: bool):
+            if waiting:
+                self.live_follow.avatar_reconnecting(session_id, decision, ds)
+            else:
+                self.live_follow.speak_started(session_id, decision, ds)
+
         try:
+            session_tts = await self._session_tts(session_id)
+            orchestrator = StreamOrchestrator(
+                llm=self._llm,
+                tts=self.approved_speech.guarded_tts(
+                    speech, session_tts, live=live, emit=self._emit
+                )
+                if speech is not None
+                else session_tts,
+                backend=self._backend,
+                avatar_status_callback=avatar_status,
+                queue=queue,
+                metrics=metrics,
+                fixed_config=self._fixed_config,
+                controller_config=self._controller_config,
+                audio_window_callback=(
+                    self.approved_speech.guarded_audio(speech, live=live, callback=opening_audio)
+                    if speech is not None
+                    else self._audio_window_callback
+                ),
+            )
+            self._register_speaking(session_id, orchestrator, queue)
+            self.live_follow.turn_selected(session_id, decision, ds)  # no-op if announced
+            self.live_follow.speak_started(session_id, decision, ds)
             await self._emit(
                 session_id,
                 {
@@ -911,17 +1925,54 @@ class DirectorCoordinator:
                 },
             )
             max_attempts = 1 + (ds.director.cfg.transient_retry_count if ds is not None else 0)
+            if decision.action == "autonomous_opening":
+                # A timed-out provider may already have emitted media.
+                max_attempts = 1
+            avatar_gate = getattr(self._backend, "speak_ready_gate_enabled", False) is True
+            # Avatar recovery must never expand the transport budget: an opening's
+            # failed TTS call may already have delivered part of its audio.
+            avatar_max_attempts = (
+                1
+                if decision.action in {"answer_cluster", "answer_fact"}
+                else 1 + AVATAR_UNIT_RETRIES
+            )
+            transport_failures = 0
+            avatar_failures = 0
             spoken_script = None
-            for attempt in range(max_attempts):
+            for attempt in range(max_attempts + (avatar_max_attempts - 1 if avatar_gate else 0)):
                 decision.attempt = attempt
                 try:
+                    if avatar_gate and decision.action in {"answer_cluster", "answer_fact"}:
+                        ready = getattr(self._backend, "avatar_ready", None)
+                        if ready is not None and not ready(session_id):
+                            raise LemonSliceError("avatar_not_ready")
                     generate = decision.prompt is not None and decision.prepared_script is None
-                    if isinstance(self._backend, FullPipelineBackend):
-                        spoken_script = await asyncio.to_thread(
-                            self._backend.say,
+                    if speech is not None:
+                        await self.approved_speech.revalidate(speech, live=live)
+                        await self._emit(
                             session_id,
-                            text,
-                            generate,
+                            {
+                                "type": "speech.content_validated",
+                                "turn_id": decision.turn_id,
+                                **speech.evidence(),
+                            },
+                        )
+                        self.approved_speech.check_live(speech, live)
+                    if isinstance(self._backend, FullPipelineBackend):
+
+                        def cloud_say():
+                            if speech is not None:
+                                self.approved_speech.check_live(speech, live)
+                                if speech.social_permit is not None:
+                                    speech.social_permit.dispatch(media=True)
+                            return self._backend.say(session_id, text, generate)
+
+                        spoken_script = await asyncio.to_thread(
+                            cloud_say,
+                        )
+                        # Provider completion is a correlation receipt, not viewer-live.
+                        await self._record_opening_media(
+                            session_id, decision, decision.turn_id, speech
                         )
                     elif decision.prepared_script is not None or not generate:
                         spoken_script = await orchestrator.speak_verbatim(session_id, text)
@@ -935,8 +1986,67 @@ class DirectorCoordinator:
                     break
                 except asyncio.CancelledError:
                     raise
+                except (AvatarDeliveryUnconfirmed, LemonSliceError) as exc:
+                    if not avatar_gate or exc.code not in {
+                        "playback_unconfirmed",
+                        "avatar_not_ready",
+                    }:
+                        raise
+                    if exc.code == "playback_unconfirmed":
+                        await asyncio.to_thread(self._backend.require_avatar_recovery, session_id)
+                    if decision.is_cancelled or not live():
+                        self._record_cancelled(session_id, decision, "turn_cancelled")
+                        return True
+                    avatar_failures += 1
+                    if avatar_failures >= avatar_max_attempts:
+                        # Explicit bounded skip, never record a successful speech receipt.
+                        if decision.action in {"answer_cluster", "answer_fact"}:
+                            self._skip_response(session_id, decision, "avatar_not_ready")
+                        elif ds is not None:
+                            # Retire the failed script position so a permanently absent avatar
+                            # cannot trap the director on this unit on every future tick.
+                            ds.director.mark_skipped(decision)
+                            self._after_speak(session_id, decision, "")
+                        self.live_follow.turn_ended(
+                            session_id, decision, ds, status="failed", reason=exc.code
+                        )
+                        skipped = {**self._speech_item(decision, "skipped"), "reason": exc.code}
+                        self._completed_speech[session_id] = skipped
+                        self._completed_history.setdefault(
+                            session_id, deque(maxlen=self._completed_history_size)
+                        ).append(skipped)
+                        st.skips += 1
+                        logger.error(
+                            "avatar delivery skipped session=%s unit=%s attempts=%s reason=%s",
+                            session_id,
+                            decision.unit_index,
+                            attempt + 1,
+                            exc.code,
+                        )
+                        await self._emit(
+                            session_id,
+                            {
+                                "type": "coordinator.avatar_delivery_skipped",
+                                "turn_id": decision.turn_id,
+                                "unit_index": decision.unit_index,
+                                "attempts": attempt + 1,
+                                "reason": exc.code,
+                            },
+                        )
+                        return True
+                    self.live_follow.avatar_reconnecting(session_id, decision, ds)
+                    await self._emit(
+                        session_id,
+                        {
+                            "type": "coordinator.retry_scheduled",
+                            "turn_id": decision.turn_id,
+                            "retry_count": attempt + 1,
+                            "error": exc.code,
+                        },
+                    )
                 except (TimeoutError, ConnectionError) as exc:
-                    if attempt + 1 >= max_attempts:
+                    transport_failures += 1
+                    if transport_failures >= max_attempts:
                         raise
                     await self._emit(
                         session_id,
@@ -947,12 +2057,32 @@ class DirectorCoordinator:
                             "error": type(exc).__name__,
                         },
                     )
-                    await asyncio.sleep(min(0.1 * (2**attempt), 0.5))
+                    await asyncio.sleep(min(0.1 * (2 ** (transport_failures - 1)), 0.5))
+            if orchestrator.is_cancelled:
+                self._record_cancelled(session_id, decision, "turn_cancelled")
+                return True
             if decision.is_cancelled or (
                 decision.revision_token and not self._runtime.has(session_id)
             ):
                 return True
-            decision.latency_spans["playback"]["end"] = time.monotonic()
+            ended = time.monotonic()
+            decision.latency_spans["playback"]["end"] = ended
+            # Where a pause between two units comes from: waiting for the turn to start, for the
+            # first audio, or the playback itself.
+            previous_end = st.last_turn_end
+            logger.info(
+                "speech turn timing session=%s unit=%s action=%s start_gap_ms=%s "
+                "first_audio_ms=%s total_ms=%s chars=%s decision_to_start_ms=%s",
+                session_id,
+                decision.unit_index,
+                decision.action,
+                "na" if previous_end is None else int((playback_started - previous_end) * 1000),
+                int((first_audio_at[0] - playback_started) * 1000) if first_audio_at else "na",
+                int((ended - playback_started) * 1000),
+                len(text or ""),
+                _decision_to_start_ms(decision, playback_started),
+            )
+            st.last_turn_end = ended
             completed = {
                 "turn_id": decision.turn_id,
                 "latency_spans": dict(decision.latency_spans),
@@ -963,6 +2093,7 @@ class DirectorCoordinator:
                 "task_id": decision.task_id,
                 "script": spoken_script,
                 "attempt": decision.attempt,
+                "validation": speech.evidence() if speech is not None else None,
             }
             self._completed_speech[session_id] = completed
             history = self._completed_history.setdefault(
@@ -970,6 +2101,7 @@ class DirectorCoordinator:
             )
             history.append(completed)
             st.decisions_emitted += 1
+            self._tts_failures.pop(session_id, None)
             st.last_decision_ts = time.monotonic()
             ds = self._runtime._sessions.get(session_id)
             if ds is not None:
@@ -978,6 +2110,22 @@ class DirectorCoordinator:
                 ds.director.mark_spoken(decision)
             await self._persist_decision(session_id, decision, text)
             self._after_speak(session_id, decision, text)
+            if decision.action == "social_reply":
+                response_kind = "chitchat"
+            elif decision.action in ("answer_fact", "answer_cluster"):
+                from ..script_authoring.answer_context import is_deflection
+
+                checked = speech.text if speech is not None else spoken_script
+                response_kind = "deflection" if is_deflection(checked) else "answer"
+            else:
+                response_kind = "script"
+            self.live_follow.turn_completed(
+                session_id,
+                decision,
+                ds,
+                response_kind=response_kind,
+                completed_at=time.time(),
+            )
             await self._emit(
                 session_id,
                 {
@@ -994,10 +2142,77 @@ class DirectorCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception(
-                "speech pipeline failed session=%s turn=%s", session_id, decision.turn_id
-            )
+            if decision.unit_index is not None:
+                # Late rejection (pre-media check, guarded media boundary) or a failed
+                # delivery: no later unit may play ahead of this one.
+                self._invalidate_queued(session_id, reason="unit_failed")
+            if decision.action == "social_reply" and isinstance(exc, SpeechRejected):
+                st.skips += 1
+                self._skip_response(session_id, decision, exc.code)
+                await self._emit(
+                    session_id,
+                    {
+                        "type": "speech.content_rejected",
+                        "turn_id": decision.turn_id,
+                        "reason": exc.code,
+                    },
+                )
+                return True
+            if self.runtime_failures is not None:
+                current = self._runtime._sessions.get(session_id)
+                if isinstance(exc, SpeechRejected):
+                    logger.warning(
+                        "speech rejected session=%s turn=%s action=%s reason=%s",
+                        session_id,
+                        decision.turn_id,
+                        decision.action,
+                        exc.code,
+                    )
+                    st.skips += 1
+                    self._note_rejected(session_id, decision)
+                    self._record_cancelled(session_id, decision, exc.code)
+                    await self._emit(
+                        session_id,
+                        {
+                            "type": "speech.content_rejected",
+                            "turn_id": decision.turn_id,
+                            "reason": exc.code,
+                        },
+                    )
+                    return True
+                if current is None or (
+                    decision.revision_token and current.generation_token != decision.revision_token
+                ):
+                    self._record_cancelled(session_id, decision, "generation_revision")
+                    return True
+                if isinstance(exc, TTSClientError):
+                    # Empty/invalid audio: the cursor did not advance, so the next turn
+                    # retries; only repeated consecutive failures end the session.
+                    self._tts_failures[session_id] = self._tts_failures.get(session_id, 0) + 1
+                if (
+                    not isinstance(exc, TTSClientError)
+                    or self._tts_failures[session_id] >= self.TTS_MAX_CONSECUTIVE_FAILURES
+                ):
+                    self.runtime_failures.fail(session_id, exc, decision.revision_token)
+                logger.error(
+                    "speech pipeline failed session=%s turn=%s class=%s detail=%s",
+                    session_id,
+                    decision.turn_id,
+                    type(exc).__name__,
+                    str(exc)[:200],  # provider error text, no credentials in it
+                )
+            else:
+                logger.exception(
+                    "speech pipeline failed session=%s turn=%s", session_id, decision.turn_id
+                )
             failure_state = "playback_timeout" if isinstance(exc, TimeoutError) else "failed"
+            self.live_follow.turn_ended(
+                session_id,
+                decision,
+                self._runtime._sessions.get(session_id),
+                status="failed",
+                reason=failure_state,
+            )
             await self._emit(
                 session_id,
                 {
@@ -1048,6 +2263,24 @@ class DirectorCoordinator:
             phase=phase,
         )
 
+    def _mark_reducer_lifecycle(self, session_id: str, decision: Decision, now: float) -> None:
+        """Reuse the store's own lifecycle state after a reducer-driven speech.
+
+        ``mark_answered`` is what makes the cooldown/novelty state durable
+        across ticks, and ``increment_skip`` mirrors the eviction budget the
+        legacy path applies to clusters it passed over. Both are no-ops for a
+        cluster the bound already evicted.
+        """
+        if self._reducer is None or decision.source_cluster_id is None:
+            return
+        store = self._reducer.session_store(session_id)
+        if store is None:
+            return
+        if decision.action in ("answer_fact", "answer_cluster"):
+            store.mark_answered(decision.source_cluster_id, now)
+        else:
+            store.mark_selected(decision.source_cluster_id, now)
+
     def _after_speak(self, session_id: str, decision: Decision, speech: str) -> None:
         """Update covered_points + advance talking_point_idx on proactive speak."""
         ds = self._runtime._sessions.get(session_id)
@@ -1087,6 +2320,11 @@ class DirectorCoordinator:
                 state.mark_product_covered(product_id, covered)
             except Exception:
                 logger.debug("coverage update failed", exc_info=True)
+        self._mark_reducer_lifecycle(session_id, decision, time.time())
+        key = self._backoff_key(decision)
+        if key is not None:
+            self._backoff.pop((session_id, key), None)
+            self._backoff_members.pop((session_id, key), None)
         # Advance cursor only for proactive (non-reactive) actions.
         if decision.action in (
             "speak_hook",

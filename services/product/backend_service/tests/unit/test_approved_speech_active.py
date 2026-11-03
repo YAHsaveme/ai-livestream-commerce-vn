@@ -1,0 +1,721 @@
+"""P0-FB-005: real app composition, HTTP binding/attach and active dispatch.
+
+Only authoring storage and media/LLM providers are controlled doubles. The
+DirectorRuntime, Coordinator, speech boundary and chunker are real.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import os
+from dataclasses import replace
+from types import SimpleNamespace
+import threading
+
+import httpx
+import pytest
+import pytest_asyncio
+
+from avatar.engines.base import FullPipelineBackend, StartResult
+from avatar.engines.mock import MockRenderBackend
+from avatar.engines.windows import AudioWindow
+from backend.application.director.decision import Decision
+from approved_speech_helpers import CLAIM, TEXT, MultiSource, Source
+from backend.application.script_authoring.approved_speech import SpeechRejected
+from backend.bootstrap import app_factory
+from backend.config import AppConfig
+
+
+class LLM:
+    name = "controlled"
+
+    def __init__(self):
+        self.output = CLAIM
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+        self.complete = False
+        self.judge = "OK"
+
+    def stream_chunks(self, request, **kwargs):
+        if "giám khảo" in request.messages[0]["content"]:
+            yield SimpleNamespace(text=self.judge)
+            return
+        self.started.set()
+        midpoint = len(self.output) // 2
+        yield SimpleNamespace(text=self.output[:midpoint])
+        assert self.release.wait(5), "test failed to release LLM"
+        self.complete = True
+        yield SimpleNamespace(text=self.output[midpoint:])
+
+
+class TTS:
+    name = "controlled"
+
+    def __init__(self, events):
+        self.calls = []
+        self.events = events
+
+    def stream_audio(self, chunk, **kwargs):
+        assert any(e.get("chunk_id") == chunk.id for e in self.events), "TTS before evidence"
+        self.calls.append(chunk.text)
+        yield AudioWindow(
+            session_id=chunk.session_id,
+            utterance_id=chunk.utterance_id,
+            seq=0,
+            sample_rate=24000,
+            duration_ms=10,
+            pcm=b"\x01\x00" * 240,
+            text_span=chunk.text,
+            is_final=True,
+        )
+
+
+class Cloud(FullPipelineBackend):
+    name = "controlled-cloud"
+
+    def __init__(self, events):
+        self.calls = []
+        self.events = events
+
+    def start(self, opts):
+        return StartResult("cloud-session", "", "")
+
+    def stop(self, sid):
+        pass
+
+    def interrupt(self, sid):
+        pass
+
+    def say(self, sid, text, generate=True):
+        assert generate is False, "opaque cloud generation bypasses validation"
+        assert any(e["type"] == "speech.content_validated" for e in self.events)
+        self.calls.append(text)
+        return text
+
+
+@pytest_asyncio.fixture
+async def case_factory(monkeypatch):
+    cases = []
+    monkeypatch.setenv("BACKEND_API_TOKEN", "")
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("TEXT_CHUNK_POLICY", "fixed")
+    monkeypatch.setenv("LIVEKIT_PUBLISH", "false")
+
+    async def create(*, cloud=False, bind=True, source=None):
+        source, llm, events = source or Source(), LLM(), []
+        tts = TTS(events)
+        backend = Cloud(events) if cloud else MockRenderBackend()
+        monkeypatch.setattr(AppConfig, "build_render_backend", lambda _: backend)
+        monkeypatch.setattr(
+            app_factory, "v1_engine_manager", lambda _: SimpleNamespace(llm=llm, tts=tts)
+        )
+        monkeypatch.setattr(app_factory, "_build_pg_store", lambda _: None)
+        monkeypatch.setattr(app_factory, "_build_script_authoring", lambda *_: source)
+        app = app_factory.create_app(
+            config=AppConfig(
+                render_backend="mock",
+                app_env="dev",
+                admin_api_token="admin-secret"
+                if os.environ.get("LIVENTO_P0_RESCUE_COMMANDS")
+                else "",
+                director_enabled=True,
+            )
+        )
+        d = app.state.container
+
+        async def emit(sid, event):
+            events.append(event)
+
+        d.hub.emit = emit
+        d.coordinator._hub = d.hub
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        start = await client.post(
+            "/api/v1/sessions",
+            json={
+                "execution_contract": "p0.execution.v1",
+                "tenant_id": "tenant-1",
+                "business_session_id": "business-1",
+                "generation": "generation-1",
+            },
+        )
+        assert start.status_code == 200, start.text
+        sid = start.json()["session_id"]
+        case = SimpleNamespace(
+            d=d,
+            client=client,
+            source=source,
+            llm=llm,
+            tts=tts,
+            backend=backend,
+            sid=sid,
+            events=events,
+        )
+        cases.append(case)
+        if bind:
+            result = await client.put(
+                f"/api/v1/sessions/{sid}/script-set",
+                json={
+                    "script_set_id": source.set.id,
+                    "tenant_id": "tenant-1",
+                    "business_session_id": "business-1",
+                },
+            )
+            assert result.status_code == 200, result.text
+            attached = await client.post(
+                f"/api/v1/sessions/{sid}/attach",
+                json={
+                    "products": [{"id": "unapproved", "name": "RAW", "price": 999}],
+                },
+            )
+            assert attached.status_code == 200, attached.text
+            assert attached.json()["products"] == list(source.set.product_ids)
+            assert sid not in d.coordinator._activated
+            assert d.director.get_session(sid).approved_envelope is not None
+            # Drive the real dispatch deterministically, without its scheduler.
+            task = d.coordinator._playback_tasks[sid]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return case
+
+    yield create
+    for case in cases:
+        case.llm.release.set()
+        case.d.coordinator.stop_all()
+        await case.client.aclose()
+        case.backend.stop_all()
+    await asyncio.sleep(0)
+
+
+@pytest.fixture
+def direct_say_guard_off(monkeypatch):
+    """Lift the 015 P0 direct-say guard so the 005 boundary stays covered.
+
+    Merchant-scoped approved speech needs an execution_contract, so the only
+    sessions that reach the boundary through /say are the P0 sessions that
+    015 now rejects up front. These tests exercise the boundary, not the route.
+    """
+
+    async def allow(d, req):
+        return None
+
+    monkeypatch.setattr(
+        importlib.import_module("backend.api.v1.sessions"), "_reject_p0_direct_say", allow
+    )
+
+
+def decision(case, *, generated=False):
+    return Decision(
+        action="answer_cluster" if generated else "introduce_product",
+        product_id="product-1",
+        prompt="Bao lâu giao hàng?" if generated else "sell raw facts",
+        revision_token=case.d.director.current_generation_token(case.sid),
+    )
+
+
+async def prepare(case, turn):
+    coordinator = case.d.coordinator
+    coordinator._decision_queue[case.sid].append(turn)
+    await coordinator._prepare_turn(case.sid, turn)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud", [False, True])
+async def test_composition_prepared_locked_text_and_evidence(case_factory, cloud):
+    case = await case_factory(cloud=cloud)
+    turn = decision(case)
+    await prepare(case, turn)
+    assert turn.prepared_script == TEXT
+    assert not case.tts.calls
+    assert not case.llm.started.is_set()
+    assert await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert case.backend.calls if cloud else case.tts.calls
+    completed = case.d.coordinator._completed_speech[case.sid]
+    assert completed["script"] == TEXT
+    assert completed["validation"]["approved_version_id"] == case.source.version.id
+    assert completed["validation"]["approval_hash"] == case.source.approval.approval_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud", [False, True])
+async def test_generated_speech_buffered_before_any_audio(case_factory, cloud):
+    case = await case_factory(cloud=cloud)
+    case.llm.release.clear()
+    turn = decision(case, generated=True)
+    pending = asyncio.create_task(case.d.coordinator._maybe_speak(case.sid, turn))
+    assert await asyncio.to_thread(case.llm.started.wait, 2)
+    assert not case.tts.calls
+    assert not getattr(case.backend, "calls", [])
+    case.llm.release.set()
+    await pending
+    assert case.llm.complete
+    said = "".join(case.backend.calls if cloud else case.tts.calls)
+    assert CLAIM in said and len(said) > len(
+        CLAIM
+    )  # the approved answer, said as a short conversation
+
+
+def _is_deflection(said: str) -> bool:
+    """The viewer-question fallback: it names the question and returns to the product, with no claim."""
+    from backend.application.script_authoring.answer_context import is_deflection
+
+    return is_deflection(said)
+
+
+def _only_deflection(case) -> bool:
+    """Unsupported text is never spoken; the fixed deflection is the only thing that may be."""
+    said = "".join(case.tts.calls)
+    return said == "" or _is_deflection(said)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Giá chỉ 999000 VND.",
+        "Giao hàng miễn phí trong một giờ.",
+        CLAIM + " Bảo hành trọn đời.",
+        "Sản phẩm chữa mọi bệnh.",
+    ],
+)
+@pytest.mark.parametrize("route", ["prepared", "generated", "direct"])
+async def test_unsupported_claims_never_reach_tts(case_factory, text, route):
+    case = await case_factory()
+    if route == "direct":
+        result = await case.client.post(
+            f"/api/v1/sessions/{case.sid}/say",
+            json={
+                "text": text,
+                "generate": False,
+            },
+        )
+        assert result.status_code == 409
+    else:
+        turn = decision(case, generated=True)
+        if route == "prepared":
+            turn.prepared_script = text
+        else:
+            case.llm.output = text
+        await prepare(case, turn)
+        await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert _only_deflection(case)
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_answer_cannot_be_the_whole_script_or_a_script_unit(case_factory):
+    case = await case_factory()
+    case.llm.output = TEXT  # not one of the whole approved facts offered to the model
+    turn = decision(case, generated=True)
+    await prepare(case, turn)
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert _only_deflection(case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "version",
+        "source_version",
+        "text",
+        "dependencies",
+        "expired",
+        "scope",
+        "hash",
+        "facts",
+    ],
+)
+async def test_binding_rechecked_before_prepared_dispatch(case_factory, change):
+    case = await case_factory()
+    turn = decision(case)
+    await prepare(case, turn)
+    meta = dict(await case.d.store.get(case.sid))
+    if change == "missing":
+        meta.pop("script_set_binding")
+    elif change in ("version", "text"):
+        key = "approved_version_id" if change == "version" else "spoken_text"
+        meta["script_set_binding"]["products"][0][key] = "tampered"
+    elif change == "dependencies":
+        case.source.deps = replace(case.source.deps, rule_set_version="rules-v2")
+    elif change == "source_version":
+        case.source.version.id = "new-approved-version"
+    elif change == "expired":
+        case.source.set.brief.facts_valid_until = "2020-01-01T00:00:00Z"
+    elif change == "scope":
+        meta["execution_contract"]["tenant_id"] = "another-tenant"
+    elif change == "hash":
+        case.source.approval.approval_hash = "0" * 64
+    else:
+        case.source.set.brief.product_facts["product-1"]["allowed_claims"] = ["Invented"]
+    await case.d.store.set(case.sid, meta)
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert not case.tts.calls
+    assert turn.is_cancelled
+
+
+@pytest.mark.asyncio
+async def test_locked_prepared_bytes_cannot_change(case_factory):
+    case = await case_factory()
+    turn = decision(case)
+    await prepare(case, turn)
+    turn.prepared_script = TEXT.replace("ba ngày", "một giờ")
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert not case.tts.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud", [False, True])
+@pytest.mark.parametrize("cancel", ["interrupt", "stop"])
+async def test_late_generated_completion_is_fenced(
+    case_factory, direct_say_guard_off, cloud, cancel
+):
+    case = await case_factory(cloud=cloud)
+    case.llm.release.clear()
+    pending = asyncio.create_task(
+        case.client.post(
+            f"/api/v1/sessions/{case.sid}/say",
+            json={
+                "text": "Bao lâu giao hàng?",
+                "generate": True,
+            },
+        )
+    )
+    assert await asyncio.to_thread(case.llm.started.wait, 2)
+    response = await case.client.post(f"/api/v1/sessions/{case.sid}/{cancel}")
+    assert response.status_code == 200, response.text
+    case.llm.release.set()
+    response = await pending
+    assert response.status_code == 409, response.text
+    assert not case.tts.calls
+    assert not getattr(case.backend, "calls", [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud", [False, True])
+@pytest.mark.parametrize("generate", [False, True])
+async def test_direct_say_valid_content_and_version_evidence(
+    case_factory, direct_say_guard_off, cloud, generate
+):
+    case = await case_factory(cloud=cloud)
+    response = await case.client.post(
+        f"/api/v1/sessions/{case.sid}/say",
+        json={
+            "text": "Bao lâu giao hàng?" if generate else TEXT,
+            "generate": generate,
+        },
+    )
+    assert response.status_code == 200, response.text
+    reply = response.json()["reply"]
+    assert (CLAIM in reply) if generate else (reply == TEXT)
+    assert response.json()["validation"]["approved_version_id"] == case.source.version.id
+
+
+@pytest.mark.asyncio
+async def test_missing_binding_direct_and_attach_fail_closed(case_factory):
+    case = await case_factory(bind=False)
+    for route, body in [("say", {"text": TEXT, "generate": False}), ("attach", {"products": []})]:
+        response = await case.client.post(f"/api/v1/sessions/{case.sid}/{route}", json=body)
+        assert response.status_code == 409, response.text
+    assert not case.tts.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud", [False, True])
+async def test_late_director_preparation_is_fenced(case_factory, cloud):
+    case = await case_factory(cloud=cloud)
+    case.llm.release.clear()
+    turn = decision(case, generated=True)
+    pending = asyncio.create_task(prepare(case, turn))
+    assert await asyncio.to_thread(case.llm.started.wait, 2)
+    await case.d.coordinator.interrupt(case.sid)
+    case.llm.release.set()
+    await pending
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert turn.is_cancelled
+    assert not case.tts.calls
+    assert not getattr(case.backend, "calls", [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["cancel", "expire"])
+async def test_pending_tts_audio_cannot_escape_after_invalidation(
+    case_factory, direct_say_guard_off, invalidate
+):
+    case = await case_factory()
+    audio = []
+
+    async def publish(window):
+        audio.append(window)
+
+    case.d.livekit_publishers = SimpleNamespace(publish=publish)
+    original = case.tts.stream_audio
+
+    def delayed_audio(chunk, **kwargs):
+        # The orchestrator holds this first window pending a finality decision.
+        yield from original(chunk, **kwargs)
+        if invalidate == "cancel":
+            case.d.approved_speech.cancel(case.sid)
+        else:
+            case.source.set.brief.facts_valid_until = "2020-01-01T00:00:00Z"
+        # Provider error flushes pending audio; the publication guard must reject it.
+        raise ConnectionError("late provider failure")
+
+    case.tts.stream_audio = delayed_audio
+    response = await case.client.post(
+        f"/api/v1/sessions/{case.sid}/say", json={"text": TEXT, "generate": False}
+    )
+    assert response.status_code == 409, response.text
+    assert case.tts.calls
+    assert not audio
+
+
+@pytest.mark.asyncio
+async def test_default_adaptive_chunker_preserves_locked_script(
+    case_factory, direct_say_guard_off, monkeypatch
+):
+    case = await case_factory()
+    monkeypatch.setenv("TEXT_CHUNK_POLICY", "adaptive_vi")
+    response = await case.client.post(
+        f"/api/v1/sessions/{case.sid}/say", json={"text": TEXT, "generate": False}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["reply"] == TEXT
+    assert case.tts.calls
+
+
+# -- ordered units: the owner's script is played part by part, in owner order ----
+
+B_UNITS = ["B mở đầu phiên live.", "B giới thiệu.", "B điểm nổi bật. " + CLAIM, "B chốt đơn."]
+A_UNITS = ["A cầu nối từ B sang A.", "A điểm nổi bật.", "A chốt đơn.", "Lời kết phiên live."]
+
+
+def spoken(case):
+    history = case.d.coordinator._completed_history[case.sid]
+    return [h["script"] for h in history if h["state"] == "completed"]
+
+
+async def play_next(case):
+    """Decide exactly as the coordinator does (on a projection), then speak for real."""
+    co, d = case.d.coordinator, case.d
+    # Harness determinism: the background scheduler would prefetch/queue turns while this
+    # helper projects and then clears the queue; stop it so only this helper decides.
+    stale = [co._tasks.get(case.sid), *co._prepare_tasks.get(case.sid, ())]
+    for task in stale:
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.gather(*[t for t in stale if t is not None], return_exceptions=True)
+    projection = co._projected_director(case.sid)
+    turn = projection.decide([], now=d.director.get_session(case.sid).now())
+    turn.revision_token = d.director.current_generation_token(case.sid)
+    await prepare(case, turn)
+    co._speech_queue[case.sid].clear()
+    assert await co._maybe_speak(case.sid, turn)
+    return turn
+
+
+async def open_session(case):
+    co = case.d.coordinator
+    envelope = await case.d.approved_speech.resolve(case.sid)
+    co.activate_approved(case.sid, "opening-1", envelope)
+    for _ in range(100):
+        if co._speech_queue[case.sid]:
+            break
+        await asyncio.sleep(0.01)
+    turn = co._speech_queue[case.sid].popleft()
+    assert await co._maybe_speak(case.sid, turn)
+
+
+@pytest.mark.asyncio
+async def test_ordered_units_play_in_owner_order_with_qa_interruption(case_factory):
+    # product-b sorts AFTER product-a lexically, but the owner put it first
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    await open_session(case)
+    for _ in range(2):
+        await play_next(case)
+    # a viewer question interrupts the middle of product-b; it is an approved answer
+    qa = decision(case, generated=True)
+    qa.product_id = "product-b"
+    await prepare(case, qa)
+    case.d.coordinator._speech_queue[case.sid].clear()
+    assert await case.d.coordinator._maybe_speak(case.sid, qa)
+    for _ in range(5):
+        await play_next(case)
+    said = spoken(case)
+    assert said[:3] == B_UNITS[:3] and CLAIM in said[3]  # the answer, said as a short conversation
+    assert said[4:] == [B_UNITS[3], *A_UNITS]
+    assert " ".join(c.strip() for c in case.tts.calls) == " ".join(spoken(case))
+    # everything is spoken: nothing left that could repeat or be skipped
+    assert spoken(case)[-1] == A_UNITS[-1]
+    projection = case.d.coordinator._projected_director(case.sid)
+    assert projection.decide([], now=999.0).action == "idle"
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_paragraph_is_spoken_once_then_moves_on(case_factory):
+    case = await case_factory()
+    await open_session(case)
+    director = case.d.director.get_session(case.sid).director
+    assert director.state.products[0].units == (TEXT,)
+    assert spoken(case) == [TEXT]
+    again = director.decide([], now=1.0)
+    assert again.text != TEXT and again.prepared_script != TEXT
+
+
+@pytest.mark.asyncio
+async def test_prepared_units_ahead_do_not_repeat(case_factory):
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    await open_session(case)
+    await case.d.coordinator._fill_prepared(case.sid)
+    await asyncio.sleep(0.2)
+    queued = [t.prepared_script for t in case.d.coordinator._speech_queue[case.sid]]
+    assert queued == B_UNITS[1:2]  # one turn ahead: a viewer answer waits for at most one unit
+
+
+@pytest.mark.asyncio
+async def test_altered_unit_or_changed_approval_speaks_nothing(case_factory):
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    for text in (B_UNITS[1] + " Thêm một câu.", "B giới thiệu khác."):
+        with pytest.raises(SpeechRejected):
+            await case.d.approved_speech.prepare(
+                case.sid, text, product_id="product-b", route="director"
+            )
+    good = await case.d.approved_speech.prepare(
+        case.sid, B_UNITS[1], product_id="product-b", route="director"
+    )
+    # the owner edits the approved text after preparation: the stale unit is refused
+    case.source.versions["product-b"] = case.source.versions["product-b"].model_copy(
+        update={"spoken_text": B_UNITS[1]}
+    )
+    with pytest.raises(SpeechRejected):
+        await case.d.approved_speech.revalidate(good)
+    assert not case.tts.calls
+
+
+@pytest.mark.asyncio
+async def test_unit_turn_without_a_unit_is_rejected_not_widened_to_whole_text(case_factory):
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    with pytest.raises(SpeechRejected) as rejected:
+        await case.d.approved_speech.prepare(
+            case.sid, "", product_id="product-b", select_locked=True, route="director"
+        )
+    assert rejected.value.code == "unit_required"
+
+
+@pytest.mark.asyncio
+async def test_late_rejection_drops_the_units_queued_behind_it(case_factory):
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    co, sid = case.d.coordinator, case.sid
+    token = case.d.director.current_generation_token(sid)
+
+    def unit(index):
+        return Decision(
+            action="sell_product",
+            product_id="product-b",
+            stage="benefit",
+            prepared_script=B_UNITS[index],
+            unit_index=index,
+            revision_token=token,
+        )
+
+    first, second = unit(1), unit(2)
+    await prepare(case, first)
+    await prepare(case, second)
+    co._speech_queue[sid].clear()
+    co._speech_queue[sid].append(second)
+    real = case.d.approved_speech.revalidate
+    calls = {"n": 0}
+
+    async def flaky(speech, *, live=lambda: True):
+        calls["n"] += 1
+        if calls["n"] == 3:  # the pre-media check inside playback, after both earlier ones
+            raise SpeechRejected("stale_execution_envelope")
+        return await real(speech, live=live)
+
+    case.d.approved_speech.revalidate = flaky
+    assert await co._maybe_speak(sid, first)
+    assert not case.tts.calls  # nothing reached media
+    assert not co._speech_queue[sid]  # the later unit did not stay queued behind the rejection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "spoken"),
+    [
+        (CLAIM, [CLAIM]),
+        ("", ["DEFLECTION"]),
+        ("Giá chỉ 999000 VND.", ["DEFLECTION"]),
+    ],
+)
+async def test_a_viewer_answer_is_a_fact_or_the_fixed_deflection(case_factory, output, spoken):
+    case = await case_factory()
+    case.llm.output = output
+    turn = decision(case, generated=True)
+    await prepare(case, turn)
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    said = "".join(case.tts.calls)
+    if spoken == [CLAIM]:
+        assert CLAIM in said and len(said) > len(CLAIM)  # the fact, said as a short conversation
+    else:
+        assert _is_deflection(said)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "accepted"),
+    [
+        ("Bên mình giao hàng trong ba ngày nhé mọi người.", True),
+        ("Bên mình giao hàng trong năm ngày nhé mọi người.", False),
+        ("Giao hàng trong 3 ngày nhé.", False),
+    ],
+)
+async def test_a_natural_answer_keeps_the_approved_numbers(case_factory, output, accepted):
+    case = await case_factory()
+    case.llm.output = output
+    turn = decision(case, generated=True)
+    await prepare(case, turn)
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    said = "".join(case.tts.calls)
+    if accepted:
+        assert output in said and len(said) > len(
+            output
+        )  # the checked answer, said as a short conversation
+    else:
+        assert _is_deflection(said)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_natural_answer_logs_why_without_its_text(case_factory, caplog):
+    case = await case_factory()
+    case.llm.output = "Bên mình giao hàng trong năm ngày nhé mọi người."
+    turn = decision(case, generated=True)
+    with caplog.at_level("INFO"):
+        await prepare(case, turn)
+    line = next(r.getMessage() for r in caplog.records if "refused by validation" in r.getMessage())
+    assert "reason=number_not_in_facts" in line
+    assert "năm ngày" not in line
+
+
+@pytest.mark.asyncio
+async def test_a_natural_answer_the_judge_refuses_is_not_spoken(case_factory):
+    case = await case_factory()
+    case.llm.output = "Bên mình giao hàng trong ba ngày nhé mọi người."
+    case.llm.judge = "NO"
+    turn = decision(case, generated=True)
+    await prepare(case, turn)
+    await case.d.coordinator._maybe_speak(case.sid, turn)
+    assert _is_deflection("".join(case.tts.calls))
+
+
+@pytest.mark.asyncio
+async def test_the_last_approved_unit_finishes_as_a_close_turn(case_factory):
+    # the API ends the live when the Runtime reports speak_finished(action=close): it must happen
+    case = await case_factory(source=MultiSource({"product-b": B_UNITS, "product-a": A_UNITS}))
+    await open_session(case)
+    for _ in range(len(B_UNITS) + len(A_UNITS) - 1):
+        await play_next(case)
+    history = list(case.d.coordinator._completed_history[case.sid])
+    assert spoken(case)[-1] == A_UNITS[-1]
+    assert history[-1]["action"] == "close" and history[-1]["state"] == "completed"
+    assert all(item["action"] != "close" for item in history[:-1])

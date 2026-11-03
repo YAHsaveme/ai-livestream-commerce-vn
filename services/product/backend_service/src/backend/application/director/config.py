@@ -9,9 +9,13 @@ portable (same object Colab -> AWS).
 from __future__ import annotations
 
 import json
+import math
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
+
+DEFLECTION_INTERVAL_SEC = 90.0
 
 
 @dataclass
@@ -50,9 +54,14 @@ class StreamConfig:
     cluster_merge_threshold: float = 0.375
 
     # Stage 2 Q&A window and prepared pipeline controls
-    max_qa_clusters_per_window: int = 2
+    # Q&A clusters answered per window; qa_window_hard_timeout_sec is still the ceiling.
+    max_qa_clusters_per_window: int = 3
     qa_window_hard_timeout_sec: float = 45.0
     qa_topic_cooldown_sec: float = 120.0
+    # 'unknown' intent lumps unrelated comments together: short cooldown, and any new
+    # comment counts as new content (see decision.py).
+    qa_unknown_topic_cooldown_sec: float = 15.0
+    deflection_interval_sec: float = DEFLECTION_INTERVAL_SEC
     answer_cache_variants: int = 3
     prepared_turn_depth: int = 3
     transient_retry_count: int = 1
@@ -60,8 +69,17 @@ class StreamConfig:
     demand_pivot_exit_share: float = 0.45
     demand_pivot_min_comments: int = 5
     demand_pivot_score_margin: float = 0.15
+    # Smallest cluster of similar comments the Director answers (high-value intents always
+    # qualify). 2 keeps a single stray comment from interrupting the script on a busy stream;
+    # on a small live every viewer matters, so 1 answers each question.
+    qa_min_cluster_size: int = 2
+    # Questions the Director may still answer on the LAST product after its time budget or cluster cap would have
+    # switched to the closing. Bounded so a busy stream cannot postpone the closing forever.
+    max_closing_qa_answers: int = 3
 
     def validate_runtime(self) -> None:
+        if not math.isfinite(self.deflection_interval_sec) or self.deflection_interval_sec <= 0:
+            raise ValueError("deflection_interval_sec must be finite and positive")
         if not 0.2 <= self.traffic_high_threshold <= 5.0:
             raise ValueError("traffic_high_threshold must be between 0.2 and 5")
         if self.max_qa_clusters_per_window < 1 or self.qa_window_hard_timeout_sec <= 0:
@@ -72,6 +90,46 @@ class StreamConfig:
             raise ValueError("pivot shares must satisfy 0 < exit < enter <= 1")
         if self.demand_pivot_min_comments < 1 or self.demand_pivot_score_margin < 0:
             raise ValueError("pivot gates must be non-negative")
+        if self.qa_min_cluster_size < 1:
+            raise ValueError("qa_min_cluster_size must be at least 1")
+        if self.max_closing_qa_answers < 0:
+            raise ValueError("max_closing_qa_answers must not be negative")
+
+    @classmethod
+    def from_env(cls) -> "StreamConfig":
+        """Defaults with the deployment's overrides (DIRECTOR_QA_MIN_CLUSTER_SIZE,
+        DIRECTOR_PREPARED_TURN_DEPTH, DIRECTOR_MAX_QA_CLUSTERS_PER_WINDOW)."""
+        raw = os.environ.get("DIRECTOR_QA_MIN_CLUSTER_SIZE", "").strip()
+        try:
+            size = int(raw) if raw else cls.qa_min_cluster_size
+        except ValueError:
+            size = cls.qa_min_cluster_size
+        raw_depth = os.environ.get("DIRECTOR_PREPARED_TURN_DEPTH", "").strip()
+        try:
+            depth = int(raw_depth) if raw_depth else 1
+        except ValueError:
+            depth = 1
+        # Approved units are prepared in milliseconds, so one turn ahead hides no latency; a
+        # deeper queue only delays a viewer's answer behind several script units.
+        raw_window = os.environ.get("DIRECTOR_MAX_QA_CLUSTERS_PER_WINDOW", "").strip()
+        try:
+            window = int(raw_window) if raw_window else cls.max_qa_clusters_per_window
+        except ValueError:
+            window = cls.max_qa_clusters_per_window
+        try:
+            interval = float(
+                os.environ.get("DIRECTOR_DEFLECTION_INTERVAL_SEC", DEFLECTION_INTERVAL_SEC)
+            )
+            if not math.isfinite(interval) or interval <= 0:
+                interval = DEFLECTION_INTERVAL_SEC
+        except ValueError:
+            interval = DEFLECTION_INTERVAL_SEC
+        return cls(
+            qa_min_cluster_size=max(1, size),
+            prepared_turn_depth=max(1, depth),
+            max_qa_clusters_per_window=min(5, max(1, window)),
+            deflection_interval_sec=interval,
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "StreamConfig":

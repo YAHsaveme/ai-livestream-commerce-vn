@@ -2,20 +2,108 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+from datetime import datetime, timezone
+import hashlib
+import os
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, Field
 
 VERSION = "p0.execution.v1"
 Phase = Literal["preparing", "ready", "warming", "selling", "closing", "ending", "ended", "failed"]
 Kind = Literal["runtime_ready", "first_ai_broadcast", "health", "phase_changed", "terminal"]
-Command = Literal["hold", "resume", "interrupt", "end", "emergency_end"]
+Command = Literal["start", "hold", "resume", "interrupt", "end", "emergency_end"]
 
-# Only contract processing and the accepted comment envelope are implemented.
-# Real rescue, autonomous opening, terminal reconciliation and signed usage
-# remain unavailable until their owning tasks implement them.
-AVAILABLE_CAPABILITIES = ("comment.p0.v1", "execution.evidence.v1", "execution.command_result.v1")
+# Contract processing, the accepted comment envelope and approved speech are implemented.
+# Terminal reconciliation and signed usage remain unavailable until their
+# owning tasks implement them.
+AVAILABLE_CAPABILITIES = (
+    "comment.p0.v1",
+    "execution.evidence.v1",
+    "execution.command_result.v1",
+    "content.approved_speech.v1",
+    "command.start",
+)
+# P0-FB-016 rescue commands (C-RESCUE-CMD-001). Disabled until compatible: the
+# API business hook for End/Emergency End ships behind the same deploy switch,
+# so neither side is advertised without the other.
+# FLAG-018-1 (P0-FB-018): `entitlement_exhausted` is a system-originated end reason,
+# accepted additively; the command-level gate (actor system:live-credits only) is in
+# api/v1/execution.py.
+ENDED_REASONS = ("normal_end", "merchant_emergency_end", "entitlement_exhausted")
+RESCUE_COMMANDS = ("hold", "resume", "interrupt", "end", "emergency_end")
+# TRUTH (open product decision F4): at P0 `end` performs NO spoken closing. The
+# approved envelope has no closing artifact, so End hard-cancels the utterance in
+# flight, moves closing -> ending at once, and viewers hear no farewell.
+RESCUE_SWITCH = "LIVENTO_P0_RESCUE_COMMANDS"
+RESCUE_EFFECTS = {
+    "hold": "held_at_safe_boundary",
+    "resume": "resumed",
+    "interrupt": "speech_cancelled",
+    "end": "closing_started",
+    "emergency_end": "ending_started",
+}
+_RESCUE_PHASES = {
+    "hold": ("warming", "selling"),
+    "resume": ("warming", "selling"),
+    "interrupt": ("warming", "selling", "closing"),
+    "end": ("warming", "selling"),
+    "emergency_end": ("warming", "selling", "closing"),
+}
+
+
+def rescue_switch_on() -> bool:
+    return os.environ.get(RESCUE_SWITCH, "").strip().lower() in ("1", "true", "yes")
+
+
+# C-TERMINAL-001 (NEW, proposed). Advertised only while the durable terminal
+# store and outbox are configured AND enabled (terminal_outcomes.py); never part
+# of the static tuple above, so the default stays "absent".
+TERMINAL_CAPABILITY = "execution.terminal.v1"
+_terminal_advertised = False
+
+
+def set_terminal_advertised(value: bool) -> None:
+    global _terminal_advertised
+    _terminal_advertised = bool(value)
+
+
+# P0-FB-018 S6 (NEW, proposed). Advertised only while the lease expiry watcher is wired
+# AND enabled (budget_lease.py); never part of the static tuple, default "absent".
+BUDGET_LEASE_CAPABILITY = "budget.lease.v1"
+
+# C-USAGE-EVIDENCE-001 (P0-FB-017). Computed, never constant: set only while the durable
+# outbox, webhook URL and secret are configured (usage_evidence.settings.capabilities()).
+_usage_capabilities: tuple[str, ...] = ()
+
+
+def set_usage_evidence_capabilities(values: tuple[str, ...]) -> None:
+    global _usage_capabilities
+    _usage_capabilities = tuple(values)
+
+
+def available_capabilities(rescue: bool = False) -> tuple[str, ...]:
+    """Rescue commands are advertised per session, never process-wide.
+
+    A session is rescue-enabled only when the API marked it at start
+    (``rescue_commands``, Facebook P0 with the API switch on) AND this
+    Runtime's switch was on at start (sessions.py). After start the marker
+    is the only gate; the live switch is never re-read.
+    """
+    base = (
+        (*AVAILABLE_CAPABILITIES, TERMINAL_CAPABILITY)
+        if _terminal_advertised
+        else AVAILABLE_CAPABILITIES
+    )
+    from backend.application.budget_lease import is_active as lease_active
+
+    if lease_active():
+        base = (*base, BUDGET_LEASE_CAPABILITY)
+
+    base = base + _usage_capabilities
+    if rescue:
+        return base + tuple(f"command.{c}" for c in RESCUE_COMMANDS)
+    return base
 
 
 def legacy_runtime_phase_hint(status: str) -> Phase | None:
@@ -37,10 +125,37 @@ class ExecutionIdentity(BaseModel):
 
 class Capabilities(BaseModel):
     version: str = VERSION
-    available: tuple[str, ...] = AVAILABLE_CAPABILITIES
+    available: tuple[str, ...] = Field(default_factory=available_capabilities)
+
+    @classmethod
+    def for_session(cls, meta: dict | None) -> "Capabilities":
+        return cls(available=available_capabilities(bool(meta and meta.get("p0_rescue"))))
 
     def supports(self, *required: str) -> bool:
         return self.version == VERSION and set(required).issubset(self.available)
+
+
+def start_command_id(identity: ExecutionIdentity) -> str:
+    # Length-prefixed UTF-8 is shared with Go; delimiters inside IDs are safe.
+    values = (
+        identity.tenant_id,
+        identity.business_session_id,
+        identity.runtime_session_id,
+        identity.generation,
+    )
+    data = b"".join(str(len(v.encode())).encode() + b":" + v.encode() for v in values)
+    return "start:" + hashlib.sha256(data).hexdigest()
+
+
+class MediaReadiness(BaseModel):
+    readiness_id: str = Field(min_length=1)
+    destination_id: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    media_ready: bool
+    platform_ready: bool
+
+    def ready(self) -> bool:
+        return self.media_ready and self.platform_ready
 
 
 class Evidence(ExecutionIdentity):
@@ -50,6 +165,20 @@ class Evidence(ExecutionIdentity):
     reason_code: str | None = None
     occurred_at: datetime
     healthy: bool | None = None
+    media_readiness: MediaReadiness | None = None
+    opening_turn_id: str | None = None
+    media_utterance_id: str | None = None
+    media_evidence_id: str | None = None
+
+
+class HoldState(BaseModel):
+    """Orthogonal execution flag, never a Phase and never business ``paused``."""
+
+    held: bool = False
+    hold_command_id: str | None = None
+    held_at: datetime | None = None
+    resumed_command_id: str | None = None
+    resumed_at: datetime | None = None
 
 
 class ExecutionState(ExecutionIdentity):
@@ -59,12 +188,58 @@ class ExecutionState(ExecutionIdentity):
     first_ai_broadcast: bool = False
     healthy: bool | None = None
     terminal_reason: str | None = None
+    media_readiness: MediaReadiness | None = None
+    approved_envelope_hash: str | None = None
+    start_command_id: str | None = None
+    opening_turn_id: str | None = None
+    first_playable_evidence_id: str | None = None
+    hold: HoldState = Field(default_factory=HoldState)
 
 
 class ContractRejection(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def same_avatar_source(before: str, after: str) -> bool:
+    """D1 track SID rotation keeps the room, avatar and audio topology unchanged."""
+    old, new = before.split("/"), after.split("/")
+    if (
+        len(old) != 3
+        or len(new) != 3
+        or old[:2] != new[:2]
+        or not old[0].startswith("lk:")
+        or len(old[0]) <= len("lk:")
+        or not old[1]
+    ):
+        return False
+    old_tracks, new_tracks = old[2].split("+"), new[2].split("+")
+    return (
+        len(old_tracks) == len(new_tracks)
+        and 1 <= len(old_tracks) <= 2
+        and all(track.strip() for track in old_tracks + new_tracks)
+    )
+
+
+def can_renew_media_readiness(state: ExecutionState, media: MediaReadiness | None) -> bool:
+    """Source-only renewal before start intent; twin of the API reducer's check."""
+    old = state.media_readiness
+    return (
+        state.phase == "ready"
+        and state.runtime_ready
+        and not state.start_command_id
+        and not state.opening_turn_id
+        and not state.first_ai_broadcast
+        and not state.first_playable_evidence_id
+        and old is not None
+        and media is not None
+        and old.ready()
+        and media.ready()
+        and old.readiness_id == media.readiness_id
+        and old.destination_id == media.destination_id
+        and same_avatar_source(old.source_id, media.source_id)
+    )
 
 
 _NEXT: dict[str, set[str]] = {
@@ -88,13 +263,31 @@ def apply_evidence(state: ExecutionState, event: Evidence) -> ExecutionState:
         raise ContractRejection("already_terminal")
     changes: dict[str, object] = {}
     if event.kind == "runtime_ready":
-        if state.phase != "preparing" or event.phase != "ready":
+        if event.phase != "ready" or (
+            state.phase != "preparing"
+            and not can_renew_media_readiness(state, event.media_readiness)
+        ):
             raise ContractRejection("invalid_lifecycle_state")
         changes["runtime_ready"] = True
+        changes["media_readiness"] = event.media_readiness
     elif event.kind == "first_ai_broadcast":
         if not state.runtime_ready or event.phase not in ("warming", "selling"):
             raise ContractRejection("runtime_not_ready")
+        if (
+            not state.start_command_id
+            or not state.opening_turn_id
+            or event.opening_turn_id != state.opening_turn_id
+            or state.media_readiness is None
+            or not state.media_readiness.ready()
+            or event.media_readiness != state.media_readiness
+            or not event.media_utterance_id
+            or not event.media_evidence_id
+        ):
+            raise ContractRejection("uncorrelated_media")
+        if state.first_ai_broadcast:
+            raise ContractRejection("already_live")
         changes["first_ai_broadcast"] = True
+        changes["first_playable_evidence_id"] = event.media_evidence_id
     elif event.kind == "health":
         if event.healthy is None or event.phase != state.phase:
             raise ContractRejection("invalid_lifecycle_state")
@@ -106,7 +299,7 @@ def apply_evidence(state: ExecutionState, event: Evidence) -> ExecutionState:
         raise ContractRejection("invalid_lifecycle_state")
     if event.phase == "failed" and event.reason_code != "execution_failed":
         raise ContractRejection("invalid_lifecycle_state")
-    if event.phase == "ended" and event.reason_code not in ("normal_end", "merchant_emergency_end"):
+    if event.phase == "ended" and event.reason_code not in ENDED_REASONS:
         raise ContractRejection("invalid_lifecycle_state")
     if event.phase in ("ended", "failed"):
         changes["terminal_reason"] = event.reason_code
@@ -120,11 +313,26 @@ class CommandRequest(ExecutionIdentity):
     requested_at: datetime
 
 
+class RescueCommandRequest(CommandRequest):
+    """Wire request: ``reason_code`` is additive and optional (FLAG-018-1).
+
+    It exists only here, never on ``CommandOutcome`` (whose ``reason_code`` is the
+    outcome reason), and only the API's ``system:live-credits`` may send it.
+    """
+
+    reason_code: str | None = None
+
+
 class CommandOutcome(CommandRequest):
     status: Literal["accepted", "applied", "rejected"]
     reason_code: str | None = None
     result_at: datetime
     sequence: int | None = None
+    opening_turn_id: str | None = None
+    effect: str | None = None
+    held: bool | None = None
+    # The accepted FLAG-018-1 end reason bound to this command_id (None when absent).
+    end_reason: str | None = None
 
 
 def command_rejection(
@@ -136,8 +344,315 @@ def command_rejection(
         return "stale_generation"
     if state.phase in ("ended", "failed"):
         return "already_terminal"
-    if request.command not in ("hold", "resume", "interrupt", "end", "emergency_end"):
+    if request.command not in ("start", "hold", "resume", "interrupt", "end", "emergency_end"):
         return "rejected_command"
     if not capabilities.supports(f"command.{request.command}"):
         return "unsupported_capability"
     return None
+
+
+# ---------------------------------------------------------------------------
+# C-TERMINAL-001: durable terminal outcome record, identity, canonical hash and
+# the pure precedence reducer. Twin of pkg/executioncontract/terminal.go; both
+# load terminal_record_v1.json byte-for-byte. Apply/apply_evidence above are
+# deliberately unchanged: nothing here is wired to a producer.
+# ---------------------------------------------------------------------------
+
+TERMINAL_SCHEMA = "p0.terminal.v1"
+_MAX_FIELD = 255
+_MAX_REF = 512
+_END_REASONS = ("normal_end", "merchant_emergency_end", "entitlement_exhausted")
+_FAILURE_CLASSES = (
+    "runtime_lost",
+    "runtime_error",
+    "platform_failed",
+    "media_failed",
+    "cleanup_failed",
+    "safety_failed",
+    "control_lost",
+)
+_CLEANUP_STATUSES = ("pending", "succeeded", "retrying", "failed")
+
+
+class TerminalRecordInvalid(ValueError):
+    pass
+
+
+class CommandRef(BaseModel):
+    command_id: str
+    actor_id: str
+
+
+class CleanupRefs(BaseModel):
+    media: str | None = None
+    livekit_room: str | None = None
+    egress: str | None = None
+    platform_live: str | None = None
+
+
+class Cleanup(BaseModel):
+    status: str = "pending"
+    attempts: int = 0
+    last_error_class: str | None = None
+    refs: CleanupRefs = Field(default_factory=CleanupRefs)
+
+
+class EvidenceRefs(BaseModel):
+    last_execution_sequence: int | None = None
+    usage_final_ref: str | None = None
+    ledger_ref: str | None = None
+    diagnostic_ref: str | None = None
+
+
+class TerminalRecord(BaseModel):
+    """Producer-owned terminal record. ``record_hash`` covers only the immutable core."""
+
+    identity: ExecutionIdentity
+    terminal_record_id: str = ""
+    terminal_phase: str
+    reason_code: str
+    failure_class: str | None = None
+    business_outcome: str
+    source: str
+    command_ref: CommandRef | None = None
+    terminal_sequence: int = 0
+    first_ai_broadcast: bool = False
+    first_playable_evidence_id: str | None = None
+    stop_requested_at: datetime | None = None
+    closing_started_at: datetime | None = None
+    ending_started_at: datetime | None = None
+    terminal_at: datetime
+    recorded_at: datetime
+    cleanup: Cleanup = Field(default_factory=Cleanup)
+    evidence_refs: EvidenceRefs = Field(default_factory=EvidenceRefs)
+    record_hash: str = ""
+
+    def sealed(self) -> "TerminalRecord":
+        record = self.model_copy(update={"terminal_record_id": terminal_record_id(self.identity)})
+        return record.model_copy(update={"record_hash": terminal_record_hash(record)})
+
+
+def _length_prefixed(*values: str) -> str:
+    return "".join(f"{len(v.encode())}:{v}" for v in values)
+
+
+def terminal_record_id(identity: ExecutionIdentity) -> str:
+    """``"tr:" + hex(SHA-256(L(tenant) L(session) L(runtime) L(generation)))``."""
+    data = _length_prefixed(
+        identity.tenant_id,
+        identity.business_session_id,
+        identity.runtime_session_id,
+        identity.generation,
+    )
+    return "tr:" + hashlib.sha256(data.encode()).hexdigest()
+
+
+def canonical_time(value: datetime | None) -> str:
+    """UTC, microsecond precision (the storage precision), empty when null."""
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        raise TerminalRecordInvalid("timestamps must be timezone-aware")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def terminal_canonical_input(record: TerminalRecord) -> str:
+    command = record.command_ref
+    return _length_prefixed(
+        TERMINAL_SCHEMA,
+        record.identity.tenant_id,
+        record.identity.business_session_id,
+        record.identity.runtime_session_id,
+        record.identity.generation,
+        record.terminal_phase,
+        record.reason_code,
+        record.failure_class or "",
+        record.business_outcome,
+        record.source,
+        command.command_id if command else "",
+        command.actor_id if command else "",
+        str(record.terminal_sequence),
+        "true" if record.first_ai_broadcast else "false",
+        record.first_playable_evidence_id or "",
+        canonical_time(record.stop_requested_at),
+        canonical_time(record.closing_started_at),
+        canonical_time(record.ending_started_at),
+        canonical_time(record.terminal_at),
+        canonical_time(record.recorded_at),
+    )
+
+
+def terminal_record_hash(record: TerminalRecord) -> str:
+    return hashlib.sha256(terminal_canonical_input(record).encode()).hexdigest()
+
+
+def validate_terminal_record(record: TerminalRecord) -> None:
+    """Shape, enums, length limits, the reason/phase/outcome matrix, derived id and hash."""
+
+    def need(ok: bool, message: str) -> None:
+        if not ok:
+            raise TerminalRecordInvalid(message)
+
+    ident = record.identity
+    for name, value in ident.model_dump().items():
+        need(bool(value.strip()), "incomplete identity")
+        need(len(value.encode()) <= _MAX_FIELD, f"{name} exceeds {_MAX_FIELD} bytes")
+    if record.terminal_phase == "ended":
+        if record.reason_code in _END_REASONS:
+            need(record.business_outcome == "ENDED", f"{record.reason_code} maps to ENDED")
+        elif record.reason_code == "pre_live_cancel":
+            need(record.business_outcome == "CANCELED", "pre_live_cancel maps to CANCELED")
+            need(
+                not record.first_ai_broadcast,
+                "pre_live_cancel is not allowed after the first AI broadcast",
+            )
+        else:
+            raise TerminalRecordInvalid("ended requires an end reason")
+        need(record.failure_class is None, "failure_class is for failed only")
+    elif record.terminal_phase == "failed":
+        need(
+            record.reason_code == "execution_failed" and record.business_outcome == "FAILED",
+            "failed requires execution_failed and FAILED",
+        )
+        need(record.failure_class in _FAILURE_CLASSES, "failed requires a known failure_class")
+    else:
+        raise TerminalRecordInvalid("terminal_phase must be ended or failed")
+    need(record.source in ("runtime", "api_supervisor", "merchant_command"), "unknown source")
+    if record.source == "merchant_command":
+        need(record.command_ref is not None, "merchant_command requires command_ref")
+    if record.command_ref is not None:
+        need(
+            bool(record.command_ref.command_id.strip())
+            and bool(record.command_ref.actor_id.strip()),
+            "command_ref needs command_id and actor_id",
+        )
+        need(len(record.command_ref.command_id.encode()) <= _MAX_FIELD, "command_id too long")
+        need(len(record.command_ref.actor_id.encode()) <= _MAX_FIELD, "actor_id too long")
+    need(record.terminal_sequence >= 0, "terminal_sequence must not be negative")
+    need(
+        record.first_playable_evidence_id is None
+        or len(record.first_playable_evidence_id.encode()) <= _MAX_FIELD,
+        "first_playable_evidence_id too long",
+    )
+    for stamp in (
+        record.stop_requested_at,
+        record.closing_started_at,
+        record.ending_started_at,
+        record.terminal_at,
+        record.recorded_at,
+    ):
+        canonical_time(stamp)  # rejects naive datetimes
+    cleanup = record.cleanup
+    need(cleanup.status in _CLEANUP_STATUSES, "unknown cleanup status")
+    need(0 <= cleanup.attempts <= 1_000_000, "cleanup attempts out of range")
+    need(
+        cleanup.last_error_class is None or len(cleanup.last_error_class.encode()) <= 64,
+        "cleanup.last_error_class too long",
+    )
+    refs = [
+        *cleanup.refs.model_dump().values(),
+        record.evidence_refs.usage_final_ref,
+        record.evidence_refs.ledger_ref,
+        record.evidence_refs.diagnostic_ref,
+    ]
+    need(all(v is None or len(v.encode()) <= _MAX_REF for v in refs), "ref exceeds 512 bytes")
+    need(
+        record.terminal_record_id == terminal_record_id(ident),
+        "terminal_record_id does not match identity",
+    )
+    need(
+        record.record_hash == terminal_record_hash(record),
+        "record_hash does not match the canonical record",
+    )
+
+
+class TerminalDecision(NamedTuple):
+    action: str  # create | replay | reject
+    reason: str = ""
+    audit: str = ""  # conflicting_terminal | late_success | late_failure
+    cleanup_failure: bool = False
+
+
+def reduce_terminal(existing: TerminalRecord | None, incoming: TerminalRecord) -> TerminalDecision:
+    """C-TERMINAL-001 precedence for one (tenant, business session, generation).
+
+    The first durable terminal wins; FAILED is never rewritten to ENDED; a late
+    success cannot erase a failure; a failure after ENDED is cleanup evidence only.
+    """
+    if existing is None:
+        return TerminalDecision("create")
+    if (
+        existing.terminal_record_id == incoming.terminal_record_id
+        and existing.record_hash == incoming.record_hash
+    ):
+        return TerminalDecision("replay")
+    audit, cleanup_failure = "conflicting_terminal", False
+    if existing.terminal_record_id == incoming.terminal_record_id:
+        if existing.terminal_phase == "failed" and incoming.terminal_phase == "ended":
+            audit = "late_success"
+        elif existing.terminal_phase == "ended" and incoming.terminal_phase == "failed":
+            audit, cleanup_failure = "late_failure", True
+    return TerminalDecision("reject", "already_terminal", audit, cleanup_failure)
+
+
+def _fill(existing: str | None, incoming: str | None) -> str | None:
+    return existing if existing is not None else incoming
+
+
+def reduce_cleanup(existing: Cleanup, incoming: Cleanup) -> tuple[Cleanup, bool]:
+    """Fill-only cleanup evidence; final failure stays final, late failure amends success."""
+    if incoming.attempts < existing.attempts:
+        return existing, False
+    status, attempts, last_error = existing.status, existing.attempts, existing.last_error_class
+    rank = {"pending": 0, "retrying": 1, "succeeded": 2, "failed": 2}
+    if existing.status != "failed" and (
+        existing.status != "succeeded" or incoming.status in ("succeeded", "failed")
+    ):
+        attempts = max(existing.attempts, incoming.attempts)
+        if rank.get(incoming.status, 2) > rank.get(existing.status, 2) or (
+            existing.status == "succeeded" and incoming.status == "failed"
+        ):
+            status = incoming.status
+        if last_error is None or (status == "failed" and existing.status != "failed"):
+            if incoming.last_error_class is not None:
+                last_error = incoming.last_error_class
+    refs = CleanupRefs(
+        media=_fill(existing.refs.media, incoming.refs.media),
+        livekit_room=_fill(existing.refs.livekit_room, incoming.refs.livekit_room),
+        egress=_fill(existing.refs.egress, incoming.refs.egress),
+        platform_live=_fill(existing.refs.platform_live, incoming.refs.platform_live),
+    )
+    merged = existing.model_copy(
+        update={
+            "status": status,
+            "attempts": attempts,
+            "last_error_class": last_error,
+            "refs": refs,
+        }
+    )
+    return merged, merged != existing
+
+
+def rescue_rejection(state: ExecutionState, command: str) -> str | None:
+    """C-RESCUE-CMD-001 validity table, after ``command_rejection`` passed."""
+    if state.phase not in _RESCUE_PHASES[command]:
+        return "invalid_lifecycle_state"
+    if command == "hold" and state.hold.held:
+        return "invalid_lifecycle_state"
+    if command == "resume" and not state.hold.held:
+        return "invalid_lifecycle_state"
+    return None
+
+
+def apply_rescue(state: ExecutionState, command: str, command_id: str, at: datetime):
+    """An applied rescue command advances the execution sequence."""
+    hold = state.hold
+    if command == "hold":
+        hold = HoldState(held=True, hold_command_id=command_id, held_at=at)
+    elif command in ("resume", "end", "emergency_end") and hold.held:
+        # End and Emergency End clear Hold; the interval closes on that command.
+        hold = hold.model_copy(
+            update={"held": False, "resumed_command_id": command_id, "resumed_at": at}
+        )
+    phase = {"end": "closing", "emergency_end": "ending"}.get(command, state.phase)
+    return state.model_copy(update={"sequence": state.sequence + 1, "phase": phase, "hold": hold})

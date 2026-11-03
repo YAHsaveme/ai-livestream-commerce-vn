@@ -12,6 +12,7 @@ idempotent registration entrypoint; construction stays lazy inside
 
 from __future__ import annotations
 
+import logging
 from typing import Iterator, Optional
 
 import numpy as np
@@ -30,12 +31,15 @@ from backend.application.contracts.llm_engines import (
     LLMResponse,
     register_engine as register_llm_engine,
 )
+from llm.engines.base import TextChunk
 from backend.application.contracts.tts_engines import (
     AudioChunk,
     TTSEngine,
     TTSRequest,
     register_engine as register_tts_engine,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _chat_request(req: LLMRequest) -> ChatRequest:
@@ -78,6 +82,51 @@ class OpenAICompatLLMEngine(LLMEngine):
     def stream(self, req: LLMRequest) -> Iterator[str]:
         yield from self._client.chat_stream(_chat_request(req))
 
+    def stream_chunks(
+        self, req: LLMRequest, *, session_id: str = "", utterance_id: str = ""
+    ) -> Iterator[TextChunk]:
+        """Default chunking plus M7.3 cost evidence: one row per call, best effort."""
+        from backend.application.usage_evidence.cost import cost_meter, new_call_id
+
+        if not (cost_meter.enabled and session_id):
+            yield from super().stream_chunks(req, session_id=session_id, utterance_id=utterance_id)
+            return
+        usage: dict = {}
+        chat = _chat_request(req)
+        chat.include_usage = cost_meter.include_usage
+        seq, buffered = 0, None
+        try:
+            for delta in self._client.chat_stream(chat, usage):
+                if buffered is not None:
+                    yield TextChunk(
+                        session_id=session_id,
+                        utterance_id=utterance_id,
+                        seq=seq,
+                        text=buffered,
+                        is_final=False,
+                    )
+                    seq += 1
+                buffered = delta
+            if buffered is not None:
+                yield TextChunk(
+                    session_id=session_id,
+                    utterance_id=utterance_id,
+                    seq=seq,
+                    text=buffered,
+                    is_final=True,
+                )
+        finally:
+            tokens = (usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            known = all(isinstance(t, int) for t in tokens)
+            cost_meter.record_llm(
+                session_id,
+                call_id=new_call_id(),
+                provider="openai_compatible",
+                model=chat.model or self._client.model,
+                input_tokens=tokens[0] if known else None,
+                output_tokens=tokens[1] if known else None,
+            )
+
     def warmup(self, system_prompt: Optional[str] = None) -> None:
         return None  # no network at startup
 
@@ -86,7 +135,13 @@ class OpenAICompatLLMEngine(LLMEngine):
 
 
 class RemoteHttpTTSEngine(TTSEngine):
-    """TTSEngine seam over the self-host TTS service client."""
+    """TTSEngine seam over the self-host TTS service client.
+
+    ``sample_rate`` always mirrors ``cfg["sample_rate"]`` so the engine
+    advertises the rate the deployment asked for (e.g. 48 kHz when
+    ``TTS_SAMPLE_RATE=48000`` alongside ``TTS_API_STYLE=openai_audio_speech``),
+    while ``synthesize`` propagates the rate the client actually got back.
+    """
 
     def __init__(self, client: SelfHostedTTSClient, sample_rate: int = 24_000) -> None:
         self._client = client
@@ -94,7 +149,7 @@ class RemoteHttpTTSEngine(TTSEngine):
 
     @classmethod
     def from_config(cls, cfg: dict) -> "RemoteHttpTTSEngine":
-        rate = int(cfg.get("sample_rate", 24_000))
+        rate = int(cfg.get("sample_rate") or 24_000)
         client = SelfHostedTTSClient(
             base_url=cfg.get("base_url", ""), api_key=cfg.get("api_key", "")
         )
@@ -110,6 +165,16 @@ class RemoteHttpTTSEngine(TTSEngine):
 
     def unload(self) -> None:
         self._client.close()
+
+
+def _warn_voice_override_ignored(engine: object, req: TTSRequest, name: str) -> None:
+    """Hosted adapters speak with the deployment voice; only the self-hosted engine honours a per-session voice."""
+    if req.voice and not getattr(engine, "_voice_warned", False):
+        engine._voice_warned = True  # once per engine, so a long session does not flood the log
+        logger.warning(
+            "tts_voice_override_ignored engine=%s (per-session voice is only honoured by remote_http)",
+            name,
+        )
 
 
 class ElevenLabsTTSEngine(TTSEngine):
@@ -131,6 +196,7 @@ class ElevenLabsTTSEngine(TTSEngine):
         return cls(client, sample_rate=rate)
 
     def synthesize(self, req: TTSRequest) -> AudioChunk:
+        _warn_voice_override_ignored(self, req, "ElevenLabsTTSEngine")
         result = self._client.synthesize(req.text)
         return AudioChunk(pcm=result.pcm, sample_rate=result.sample_rate)
 
@@ -158,6 +224,7 @@ class OpenAISpeechTTSEngine(TTSEngine):
         return cls(client, sample_rate=rate)
 
     def synthesize(self, req: TTSRequest) -> AudioChunk:
+        _warn_voice_override_ignored(self, req, "OpenAISpeechTTSEngine")
         result = self._client.synthesize(req.text)
         return AudioChunk(pcm=result.pcm, sample_rate=result.sample_rate)
 

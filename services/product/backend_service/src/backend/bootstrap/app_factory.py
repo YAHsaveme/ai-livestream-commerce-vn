@@ -26,7 +26,7 @@ from .lifespan import build_lifespan
 logger = logging.getLogger(__name__)
 
 
-def _build_director_pipeline(config, backend, engine_manager):
+def _build_director_pipeline(config, backend, engine_manager, hub=None, store=None):
     """Construct the agentic Director pipeline (P0-01).
 
     Returns ``(runtime, coordinator, reducer)`` or ``(None, None, None)`` when
@@ -43,14 +43,22 @@ def _build_director_pipeline(config, backend, engine_manager):
 
     embedder = HashingEmbedder()  # offline/CI-safe; reducer REQUIRES an embedder
     runtime = DirectorRuntime(backend, embedder=embedder)
+    reducer = FastReducer(embedder=embedder)
     coordinator = DirectorCoordinator(
         runtime=runtime,
         llm=engine_manager.llm if engine_manager is not None else None,
         tts=engine_manager.tts if engine_manager is not None else None,
         backend=backend,
         cfg=CoordinatorConfig(),
+        # The coordinator consults the reducer ONLY for sessions in reducer
+        # mode (P0-FB-014); a legacy session never sees it.
+        reducer=reducer,
+        # The container's hub: without it every coordinator.* event (speak_finished, the API's
+        # auto-end trigger) is silently dropped.
+        hub=hub,
+        session_store=store,
+        engine_manager=engine_manager,
     )
-    reducer = FastReducer(embedder=embedder)
     return runtime, coordinator, reducer
 
 
@@ -66,11 +74,18 @@ def _build_container(config, container: BootstrapContainer | None) -> BootstrapC
     pg_store = _build_pg_store(config)
     script_authoring = _build_script_authoring(config, engine_manager, pg_store)
     from backend.application.platform_events import PlatformEventIngestionService
+    from backend.application.safety_gate import SafetyGate
     from backend.application.publishing import LiveKitPublisherRegistry, publish_enabled
 
-    director, coordinator, reducer = _build_director_pipeline(config, backend, engine_manager)
+    from backend.api.v1.hub import ControlHub
+
+    hub = ControlHub()
+    director, coordinator, reducer = _build_director_pipeline(
+        config, backend, engine_manager, hub=hub, store=store
+    )
 
     return create_container(
+        hub=hub,
         backend=backend,
         store=store,
         config=config,
@@ -87,6 +102,7 @@ def _build_container(config, container: BootstrapContainer | None) -> BootstrapC
             coordinator=coordinator,
             runtime=director,
             reducer=reducer,
+            safety_gate=SafetyGate(),
         ),
     )
 
@@ -412,6 +428,32 @@ def create_app(
         )
     else:
         resolved_container = _build_container(config, container=None)
+
+    from backend.application.script_authoring.approved_speech import ApprovedSpeech
+    from backend.application.platform_events import PlatformEventIngestionService
+
+    # Injected provider/test containers must retain the same effective safety
+    # boundary as the deployed composition, including active direct generation.
+    if resolved_container.event_ingestion is None:
+        resolved_container.event_ingestion = PlatformEventIngestionService(
+            store=resolved_container.store,
+            pg_store=resolved_container.pg_store,
+            coordinator=resolved_container.coordinator,
+            runtime=resolved_container.director,
+            reducer=resolved_container.reducer,
+        )
+
+    resolved_container.approved_speech = ApprovedSpeech(
+        resolved_container.store, lambda: resolved_container.script_authoring_service
+    )
+    if resolved_container.coordinator is not None:
+        resolved_container.coordinator.approved_speech = resolved_container.approved_speech
+        # The tick reports the comments it really consumed so teardown does
+        # not reconcile them as non_deliverable (P0-FB-013). The sink runs
+        # here, after ingress is resolved, so injected containers get it too.
+        resolved_container.coordinator.comment_consumed = (
+            resolved_container.event_ingestion.mark_consumed
+        )
 
     app_lifespan = lifespan if lifespan is not None else build_lifespan(resolved_container)
     app = FastAPI(title="VN Live-Commerce Host — core API", lifespan=app_lifespan)

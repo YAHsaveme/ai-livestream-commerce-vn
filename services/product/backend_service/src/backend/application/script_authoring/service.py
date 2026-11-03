@@ -77,6 +77,16 @@ class ScriptAuthoringService(Protocol):
         revision: int | None,
     ) -> dict[str, Any] | None: ...
 
+    async def save_draft_parts(
+        self,
+        *,
+        set_id: str,
+        product_id: str,
+        parts: list[dict[str, Any]],
+        expected_version_id: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any] | None: ...
+
     async def submit_for_gate(self, *, set_id: str, product_id: str) -> dict[str, Any] | None: ...
 
     async def preview_product(
@@ -100,6 +110,9 @@ class ScriptAuthoringService(Protocol):
         product_id: str,
         segment_index: int,
         idempotency_key: str,
+        expected_version_id: str | None = None,
+        part_id: str | None = None,
+        intent: str | None = None,
     ) -> dict[str, Any] | None: ...
 
     async def fix_with_ai(
@@ -141,9 +154,15 @@ class ScriptAuthoringService(Protocol):
         product_ids: list[str],
         target_duration_s: int,
         idempotency_key: str,
+        ordered_units: bool = False,
+        replace_existing: bool = False,
     ) -> dict[str, Any] | None: ...
 
     async def get_batch(self, *, set_id: str, batch_id: str) -> dict[str, Any] | None: ...
+
+    async def get_workflow(
+        self, *, set_id: str, product_id: str, workflow_id: str
+    ) -> dict[str, Any]: ...
 
     async def cancel_batch(self, *, set_id: str, batch_id: str) -> dict[str, Any] | None: ...
 

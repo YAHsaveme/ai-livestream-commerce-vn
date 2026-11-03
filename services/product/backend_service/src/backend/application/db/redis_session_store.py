@@ -41,6 +41,16 @@ end
 """
 
 
+_LOCK_DELETE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[2])
+  return 1
+else
+  return 0
+end
+"""
+
+
 @dataclass(frozen=True)
 class SessionLockFence:
     """Proof of a held per-session lock, carried to protected writes."""
@@ -74,9 +84,24 @@ class RedisSessionStore(SessionStore):
         client = await self._ensure()
         await client.set(f"session:{session_id}", json.dumps(data), ex=ttl_seconds or self._ttl)
 
+    async def ttl_remaining(self, session_id: str) -> Optional[float]:
+        """Seconds until the session meta expires (None: unknown or no expiry)."""
+        client = await self._ensure()
+        left = await client.ttl(f"session:{session_id}")
+        return float(left) if left is not None and left >= 0 else None
+
     async def delete(self, session_id: str) -> bool:
         client = await self._ensure()
         return (await client.delete(f"session:{session_id}")) > 0
+
+    async def list_session_ids(self) -> list[str]:
+        client = await self._ensure()
+        ids: list[str] = []
+        async for key in client.scan_iter(match="session:*"):
+            text = key.decode() if isinstance(key, bytes) else key
+            if not text.endswith(":lock"):
+                ids.append(text[len("session:") :])
+        return ids
 
     async def exists(self, session_id: str) -> bool:
         client = await self._ensure()
@@ -134,6 +159,18 @@ class RedisSessionStore(SessionStore):
             yield fence
         finally:
             await self.release_session_lock(session_id, token)
+
+    async def delete_if_owner(self, fence: SessionLockFence) -> bool:
+        """Delete the session meta only while we still hold the lock (one Lua round-trip)."""
+        client = await self._ensure()
+        done = await client.eval(
+            _LOCK_DELETE_SCRIPT,
+            2,
+            self._lock_key(fence.session_id),
+            f"session:{fence.session_id}",
+            fence.token,
+        )
+        return bool(done)
 
     async def commit_if_owner(
         self, fence: SessionLockFence, data: dict, ttl_seconds: Optional[int] = None

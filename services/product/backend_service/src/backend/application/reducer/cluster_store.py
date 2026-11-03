@@ -744,6 +744,12 @@ class ClusterStore:
     # Reads
     # ------------------------------------------------------------------
 
+    @property
+    def config(self) -> ClusterStoreConfig:
+        """The store's typed knobs. Public read so a consumer can honour
+        ``max_representatives`` when it projects a cluster (P0-FB-014)."""
+        return self._config
+
     def active_clusters(self, now: float) -> list[LiveCluster]:
         """Clusters with any member inside the rolling horizon, demand-sorted.
 
@@ -760,6 +766,15 @@ class ClusterStore:
     def cluster_count(self) -> int:
         """Total clusters currently held (public read for the reducer seam)."""
         return len(self._clusters)
+
+    def live_member_ids(self) -> set[str]:
+        return {cid for c in self._clusters.values() for cid in c.member_ids}
+
+    def membership(self) -> dict[str, tuple[str, str]]:
+        """``{comment_id: (cluster_id, intent)}`` for every live member (read-only)."""
+        return {
+            cid: (c.cluster_id, c.intent) for c in self._clusters.values() for cid in c.member_ids
+        }
 
     def stats(self) -> dict:
         """Content-safe counters (no raw viewer text)."""

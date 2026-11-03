@@ -52,11 +52,12 @@ _VERSION_COLS = (
 )
 _PLAN_COLS = (
     "id, script_item_id, version, product_id, target_duration_s, segment_count, "
-    "fingerprint, created_at"
+    "fingerprint, unit_briefs::text AS unit_briefs, created_at"
 )
 _SEGMENT_COLS = (
     "id, script_item_id, plan_id, segment_index, title, intent, target_duration_s, "
-    "display_text, spoken_text, status, version, created_at"
+    "display_text, spoken_text, status, version, part_id, provenance::text AS provenance, "
+    "created_at"
 )
 _GATE_COLS = (
     "id, script_item_id, is_full AS full, passed, rule_set_fingerprint, "
@@ -76,7 +77,7 @@ _JOB_COLS = (
     "id, batch_id, script_item_id, product_id, intent, status, plan_id, "
     "plan_segment_count, current_segment_index, attempt_count, target_duration_s, "
     "fingerprint::text AS fingerprint, idempotency_key, lease_owner, lease_expires_at, "
-    "lease_epoch, created_at, updated_at"
+    "lease_epoch, created_at, updated_at, input_snapshot::text AS input_snapshot, error_code"
 )
 
 # Plain column lists for INSERT (no casts / aliases).
@@ -92,11 +93,12 @@ _VERSION_INS = (
 )
 _PLAN_INS = (
     "id, script_item_id, version, product_id, target_duration_s, segment_count, "
-    "fingerprint, created_at"
+    "fingerprint, unit_briefs, created_at"
 )
 _SEGMENT_INS = (
     "id, script_item_id, plan_id, segment_index, title, intent, "
-    "target_duration_s, display_text, spoken_text, status, version, created_at"
+    "target_duration_s, display_text, spoken_text, status, version, part_id, provenance, "
+    "created_at"
 )
 _GATE_INS = (
     "id, script_item_id, is_full, passed, rule_set_fingerprint, "
@@ -113,7 +115,7 @@ _BATCH_INS = (
 _JOB_INS = (
     "id, batch_id, script_item_id, product_id, intent, status, plan_id, "
     "plan_segment_count, current_segment_index, attempt_count, target_duration_s, "
-    "fingerprint, idempotency_key, created_at, updated_at"
+    "fingerprint, idempotency_key, created_at, updated_at, input_snapshot, error_code"
 )
 
 
@@ -256,6 +258,13 @@ class ScriptSetRepository(_Repo):
 
 
 class ScriptItemRepository(_Repo):
+    async def lock_revision(self, item_id: str, *, conn) -> int | None:
+        """Row-lock the item inside the caller's transaction and return its revision."""
+        row = await self._fetchone(
+            "SELECT revision FROM script_items WHERE id = $1 FOR UPDATE", item_id, conn=conn
+        )
+        return row["revision"] if row else None
+
     async def insert(self, item: ScriptItem, *, conn=None) -> None:
         await self._execute(
             f"INSERT INTO script_items ({_ITEM_INS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -339,7 +348,7 @@ class PlanRepository(_Repo):
             async with c.transaction() if acquired else _null_transaction():
                 await c.execute(
                     f"INSERT INTO product_script_plans ({_PLAN_INS}) "
-                    f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                    f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)",
                     plan.id,
                     plan.script_item_id,
                     plan.version,
@@ -347,6 +356,7 @@ class PlanRepository(_Repo):
                     plan.target_duration_s,
                     plan.segment_count,
                     plan.fingerprint,
+                    json.dumps(plan.unit_briefs) if plan.unit_briefs is not None else None,
                     _dts(plan.created_at),
                 )
                 for segment in plan.segments:
@@ -356,9 +366,10 @@ class PlanRepository(_Repo):
 
     @staticmethod
     async def _insert_segment(c, segment: ScriptSegment) -> None:
-        await c.execute(
+        await _execute_segment_insert(
+            c,
             f"INSERT INTO script_segments ({_SEGMENT_INS}) "
-            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)",
             segment.id,
             segment.script_item_id,
             segment.plan_id,
@@ -370,6 +381,8 @@ class PlanRepository(_Repo):
             segment.spoken_text,
             segment.status.value,
             segment.version,
+            segment.part_id,
+            json.dumps(segment.provenance) if segment.provenance is not None else None,
             _dts(segment.created_at),
         )
 
@@ -395,7 +408,8 @@ class PlanRepository(_Repo):
     async def _with_segments(self, row, *, conn=None) -> ProductScriptPlan:
         rows = await self._fetchall(
             "SELECT id, script_item_id, plan_id, segment_index, title, intent, "
-            "target_duration_s, display_text, spoken_text, status, version, created_at "
+            "target_duration_s, display_text, spoken_text, status, version, part_id, "
+            "provenance::text AS provenance, created_at "
             "FROM script_segments WHERE plan_id = $1 ORDER BY segment_index, version",
             row["id"],
             conn=conn,
@@ -410,6 +424,7 @@ class PlanRepository(_Repo):
             latest_by_index[r["segment_index"]] = r
         data = dict(row)
         data["created_at"] = _iso(data["created_at"])
+        data["unit_briefs"] = _json_rows(data.get("unit_briefs"), None)
         data["K"] = data.pop("segment_count")
         data["segments"] = [
             self._segment_from_row(latest_by_index[i]) for i in sorted(latest_by_index)
@@ -419,6 +434,7 @@ class PlanRepository(_Repo):
     @staticmethod
     def _segment_from_row(row) -> ScriptSegment:
         data = dict(row)
+        data["provenance"] = _json_rows(data.get("provenance"), None)
         data["created_at"] = _iso(data["created_at"])
         return ScriptSegment.model_validate(data)
 
@@ -434,9 +450,10 @@ class SegmentRepository(_Repo):
 
     @staticmethod
     async def _insert_segment(c, segment: ScriptSegment) -> None:
-        await c.execute(
+        await _execute_segment_insert(
+            c,
             f"INSERT INTO script_segments ({_SEGMENT_INS}) "
-            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)",
             segment.id,
             segment.script_item_id,
             segment.plan_id,
@@ -448,6 +465,8 @@ class SegmentRepository(_Repo):
             segment.spoken_text,
             segment.status.value,
             segment.version,
+            segment.part_id,
+            json.dumps(segment.provenance) if segment.provenance is not None else None,
             _dts(segment.created_at),
         )
 
@@ -481,12 +500,23 @@ class SegmentRepository(_Repo):
         if row is None:
             return None
         data = dict(row)
+        data["provenance"] = _json_rows(data.get("provenance"), None)
         data["created_at"] = _iso(data["created_at"])
         return ScriptSegment.model_validate(data)
 
 
 class VersionRepository(_Repo):
     async def insert(self, version: ScriptVersion, *, conn=None) -> None:
+        try:
+            await self._insert(version, conn=conn)
+        except Exception as exc:
+            if exc.__class__.__name__ == "UniqueViolationError":
+                raise StaleRevisionError(
+                    "script version already written by another request"
+                ) from exc
+            raise
+
+    async def _insert(self, version: ScriptVersion, *, conn=None) -> None:
         await self._execute(
             f"INSERT INTO script_versions ({_VERSION_INS}) "
             f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::jsonb,$13)",
@@ -872,7 +902,7 @@ class JobRepository(_Repo):
     async def insert(self, job: GenerationJob, *, conn=None) -> None:
         await self._execute(
             f"INSERT INTO script_generation_jobs ({_JOB_INS}) "
-            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15)",
+            f"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16::jsonb,$17)",
             job.id,
             job.batch_id,
             job.script_item_id,
@@ -888,6 +918,8 @@ class JobRepository(_Repo):
             job.idempotency_key,
             _dts(job.created_at),
             _dts(job.updated_at),
+            json.dumps(job.input_snapshot),
+            job.error_code,
             conn=conn,
         )
 
@@ -965,20 +997,22 @@ class JobRepository(_Repo):
             await self._execute(
                 "UPDATE script_generation_jobs SET status=$2, plan_id=$3, "
                 "plan_segment_count=$4, current_segment_index=$5, attempt_count=$6, "
-                "updated_at=NOW() WHERE id=$1",
+                "error_code=$7, input_snapshot=$8::jsonb, updated_at=NOW() WHERE id=$1",
                 job.id,
                 job.status.value,
                 job.plan_id,
                 job.plan_segment_count,
                 job.current_segment_index,
                 job.attempt_count,
+                job.error_code,
+                json.dumps(job.input_snapshot),
                 conn=conn,
             )
             return
         status = await self._execute(
             "UPDATE script_generation_jobs SET status=$2, plan_id=$3, "
             "plan_segment_count=$4, current_segment_index=$5, attempt_count=$6, "
-            "lease_expires_at=NOW() + make_interval(secs => $7), updated_at=NOW() "
+            "error_code=$10, input_snapshot=$11::jsonb, lease_expires_at=NOW() + make_interval(secs => $7), updated_at=NOW() "
             "WHERE id=$1 AND lease_owner=$8 AND lease_epoch=$9 RETURNING id",
             job.id,
             job.status.value,
@@ -989,6 +1023,8 @@ class JobRepository(_Repo):
             lease_duration_s,
             lease_owner,
             lease_epoch,
+            job.error_code,
+            json.dumps(job.input_snapshot),
             conn=conn,
         )
         if status != "UPDATE 1":
@@ -1059,6 +1095,7 @@ class JobRepository(_Repo):
             return None
         data = dict(row)
         data["fingerprint"] = _json_rows(data["fingerprint"], None)
+        data["input_snapshot"] = _json_rows(data.get("input_snapshot"), {})
         data["created_at"] = _iso(data["created_at"])
         data["updated_at"] = _iso(data["updated_at"])
         data["lease_expires_at"] = _iso(data["lease_expires_at"])
@@ -1084,6 +1121,16 @@ class IdempotencyRepository(_Repo):
         )
 
 
+async def _execute_segment_insert(c, sql: str, *args) -> None:
+    """A concurrent writer already took this (plan, index, version): report it as a lost race."""
+    try:
+        await c.execute(sql, *args)
+    except Exception as exc:
+        if exc.__class__.__name__ == "UniqueViolationError":
+            raise StaleRevisionError("segment version already written by another request") from exc
+        raise
+
+
 class _NullTransaction:
     """Async context manager no-op used when a caller already owns a transaction."""
 
@@ -1096,6 +1143,22 @@ class _NullTransaction:
 
 def _null_transaction():
     return _NullTransaction()
+
+
+class ModelWriteBudgetRepository(_Repo):
+    async def reserve(
+        self, batch_id: str, product_id: str, index: int, *, operation_id: str = "full"
+    ) -> bool:
+        row = await self._fetchone(
+            "INSERT INTO script_model_write_budget(batch_id,product_id,unit_index,operation_id,writes) VALUES ($1,$2,$3,$4,1) "
+            "ON CONFLICT (batch_id,product_id,unit_index,operation_id) DO UPDATE SET writes=script_model_write_budget.writes+1 "
+            "WHERE script_model_write_budget.writes<3 RETURNING writes",
+            batch_id,
+            product_id,
+            index,
+            operation_id,
+        )
+        return row is not None
 
 
 class PostgresAuthoringRepositories:
@@ -1113,6 +1176,7 @@ class PostgresAuthoringRepositories:
         self.approvals = ApprovalRepository(self)
         self.batches = BatchRepository(self)
         self.jobs = JobRepository(self)
+        self.model_budget = ModelWriteBudgetRepository(self)
         self.idempotency = IdempotencyRepository(self)
 
     @property

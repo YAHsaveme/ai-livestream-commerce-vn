@@ -6,6 +6,9 @@ fail. GREEN once ``PostgresAuthoringRepositories`` implements the interfaces.
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from backend.application.db.postgres_store import PostgresRuntimeStore
@@ -38,6 +41,143 @@ async def _connect(pg_url: str):
     repos = PostgresAuthoringRepositories(pg_url)
     await repos.connect()
     return repos
+
+
+@pytest.mark.asyncio
+async def test_model_dispatch_budget_is_atomic_and_survives_reconnect(pg_url: str):
+    repos = await _connect(pg_url)
+    s = _set()
+    await repos.script_sets.insert(s)
+    batch = GenerationBatch(id=new_id("batch"), script_set_id=s.id)
+    await repos.batches.insert(batch, state=BatchState(batch_id=batch.id, script_set_id=s.id))
+    try:
+        accepted = await asyncio.gather(
+            *(repos.model_budget.reserve(batch.id, "p1", 1) for _ in range(10))
+        )
+        assert sum(accepted) == 3
+    finally:
+        await repos.close()
+    repos = await _connect(pg_url)
+    try:
+        assert not await repos.model_budget.reserve(batch.id, "p1", 1)
+        assert await repos.model_budget.reserve(batch.id, "p1", 1, operation_id="repair-one")
+        assert await repos.model_budget.reserve(batch.id, "p1", 1, operation_id="repair-two")
+    finally:
+        await repos.close()
+
+
+@pytest.mark.asyncio
+async def test_recovered_replacement_then_new_generation_respects_unique_versions(pg_url: str):
+    from backend.application.script_authoring.service_impl import ScriptAuthoringServiceImpl
+
+    repos = await _connect(pg_url)
+    engine = SimpleNamespace(
+        llm_cfg={"engine": "fake"}, llm_failed=False, get_llm_fn=lambda **kwargs: lambda prompt: ""
+    )
+    service = ScriptAuthoringServiceImpl(repos, engine_manager=engine)
+    try:
+        created = await service.create_script_set(
+            name="proof",
+            transition_policy="ORDER_AWARE",
+            product_ids=["p1"],
+            brief={
+                "product_facts": {
+                    "p1": {
+                        "product_name": "Áo denim",
+                        "prices": ["180000 VND"],
+                        "allowed_claims": [
+                            "Chất vải denim dày dặn.",
+                            "Giao hàng toàn quốc từ hai đến ba ngày.",
+                        ],
+                    }
+                }
+            },
+        )
+        set_id = created["id"]
+
+        async def start(key):
+            return await service.start_batch_generation(
+                set_id=set_id,
+                product_ids=[],
+                target_duration_s=60,
+                idempotency_key=key,
+                ordered_units=True,
+                replace_existing=True,
+            )
+
+        await start("first")
+        await asyncio.gather(*service._tasks)
+        original = await repos.items.get_by_product(set_id, "p1")
+        assert original.current_version_id is not None
+        spawn = service._spawn
+        service._spawn = lambda coro, **kwargs: coro.close()
+        batch_id = (await start("recovery"))["batch_id"]
+        orch = service._active_orchestrators[batch_id]
+        for _ in range(2):
+            await asyncio.to_thread(orch.step)
+        revisions = await service._current_item_revisions(batch_id)
+        await service._drain_artifacts(service._batch_artifact_bridges[batch_id], revisions, set())
+        await service._drain_batch_persists(batch_id, service._batch_persist_queues[batch_id])
+        recovered, queue, bridge = await service._recover_orchestrator(batch_id, set_id)
+        existing = {v.id for v in await repos.versions.list_by_item(original.id)}
+        await service._run_batch_job(batch_id, recovered, queue, bridge, revisions, existing)
+        versions = await repos.versions.list_by_item(original.id)
+        assert [v.version for v in versions] == [1, 2]
+        service._spawn = spawn
+        await start("third")
+        await asyncio.gather(*service._tasks)
+        assert [v.version for v in await repos.versions.list_by_item(original.id)] == [1, 2, 3]
+        # Terminal receipt and new text must roll back together if the job
+        # update fails, and a successful receipt must survive recovery/replay.
+        item = await repos.items.get(original.id)
+        source = await repos.versions.get(item.current_version_id)
+        segment = await repos.segments.get(source.segment_version_ids[2])
+        calls = []
+
+        def write(prompt):
+            calls.append(prompt)
+            return segment.spoken_text
+
+        engine.get_llm_fn = lambda **kwargs: write
+        update = repos.jobs.update
+
+        async def fail_terminal(job, *, conn=None, **kwargs):
+            await update(job, conn=conn, **kwargs)
+            if job.status is GenerationJobStatus.COMPLETED:
+                assert conn is not None
+                raise ConnectionError("injected before commit")
+
+        repos.jobs.update = fail_terminal
+        failed = await service.regenerate_segment(
+            set_id=set_id,
+            product_id="p1",
+            segment_index=segment.segment_index,
+            idempotency_key="atomic-fail",
+            expected_version_id=source.id,
+        )
+        await asyncio.gather(*service._tasks)
+        assert (await repos.jobs.get(failed["workflow_id"])).status is GenerationJobStatus.FAILED
+        assert (await repos.items.get(original.id)).current_version_id == source.id
+        assert len(await repos.versions.list_by_item(original.id)) == 3
+        repos.jobs.update = update
+        request = dict(
+            set_id=set_id,
+            product_id="p1",
+            segment_index=segment.segment_index,
+            idempotency_key="atomic-success",
+            expected_version_id=source.id,
+        )
+        succeeded = await service.regenerate_segment(**request)
+        await asyncio.gather(*service._tasks)
+        completed = await repos.jobs.get(succeeded["workflow_id"])
+        assert completed.status is GenerationJobStatus.COMPLETED
+        count = len(calls)
+        await service._resume_job(completed)
+        assert (await service.regenerate_segment(**request))["workflow_id"] == completed.id
+        assert len(calls) == count and count >= 2
+    finally:
+        await service.drain()
+        await repos.close()
 
 
 def _set(title: str = "t") -> ScriptSet:
@@ -143,6 +283,139 @@ async def test_plan_and_segments_roundtrip(pg_url: str) -> None:
         assert [seg.segment_index for seg in loaded.segments] == [0, 1]
         latest = await repos.plans.get_latest(item.id)
         assert latest is not None and latest.id == plan.id
+    finally:
+        await repos.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_briefs_and_segment_provenance_roundtrip(pg_url: str) -> None:
+    repos = await _connect(pg_url)
+    try:
+        s = _set()
+        await repos.script_sets.insert(s)
+        item = _item(s.id)
+        await repos.items.insert(item)
+        briefs = {"schema_version": 1, "parts": [{"part_id": "part:1", "role": "highlight"}]}
+        plan = ProductScriptPlan(
+            id=new_id("plan"),
+            script_item_id=item.id,
+            product_id="p1",
+            target_duration_s=600,
+            K=1,
+            unit_briefs=briefs,
+        )
+        await repos.plans.insert(plan)
+        fallback = ScriptSegment(
+            id=new_id("segment"),
+            script_item_id=item.id,
+            plan_id=plan.id,
+            segment_index=0,
+            spoken_text="a",
+            part_id="part:1",
+            provenance={"source": "fallback", "fallback_reason_code": "coverage_missing"},
+        )
+        legacy = ScriptSegment(
+            id=new_id("segment"),
+            script_item_id=item.id,
+            plan_id=plan.id,
+            segment_index=0,
+            version=2,
+            spoken_text="b",
+        )
+        await repos.segments.insert(fallback)
+        await repos.segments.insert(legacy)
+        loaded = await repos.plans.get(plan.id)
+        assert loaded is not None and loaded.unit_briefs == briefs
+        got = await repos.segments.get(fallback.id)
+        assert (
+            got.part_id == "part:1" and got.provenance["fallback_reason_code"] == "coverage_missing"
+        )
+        old = await repos.segments.get(legacy.id)
+        assert old.part_id is None and old.provenance is None
+        assert (await repos.plans.get_latest(item.id)).segments[0].id == legacy.id
+    finally:
+        await repos.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_segment_version_is_reported_as_a_lost_race(pg_url: str) -> None:
+    from backend.application.script_authoring.repositories import StaleRevisionError
+
+    repos = await _connect(pg_url)
+    try:
+        s = _set()
+        await repos.script_sets.insert(s)
+        item = _item(s.id)
+        await repos.items.insert(item)
+        plan = ProductScriptPlan(
+            id=new_id("plan"), script_item_id=item.id, product_id="p1", target_duration_s=60, K=1
+        )
+        await repos.plans.insert(plan)
+
+        def seg() -> ScriptSegment:
+            return ScriptSegment(
+                id=new_id("segment"),
+                script_item_id=item.id,
+                plan_id=plan.id,
+                segment_index=0,
+                version=2,
+                spoken_text="x",
+            )
+
+        await repos.segments.insert(seg())
+        with pytest.raises(StaleRevisionError):
+            await repos.segments.insert(seg())
+    finally:
+        await repos.close()
+
+
+@pytest.mark.asyncio
+async def test_item_lock_serializes_two_concurrent_saves_and_version_clash_is_stale(
+    pg_url: str,
+) -> None:
+    import asyncio
+
+    from backend.application.script_authoring.repositories import StaleRevisionError
+
+    repos = await _connect(pg_url)
+    try:
+        s = _set()
+        await repos.script_sets.insert(s)
+        item = _item(s.id)
+        await repos.items.insert(item)
+        first_holds_lock = asyncio.Event()
+        release_first = asyncio.Event()
+        seen: dict[str, int | None] = {}
+
+        async def winner() -> None:
+            async with repos.transaction() as conn:
+                seen["winner"] = await repos.items.lock_revision(item.id, conn=conn)
+                first_holds_lock.set()
+                await release_first.wait()
+                await repos.items.update(item, expected_revision=0, conn=conn)
+
+        async def loser() -> None:
+            await first_holds_lock.wait()
+            async with repos.transaction() as conn:
+                # blocks on the row lock until the winner commits, then sees its revision
+                seen["loser"] = await repos.items.lock_revision(item.id, conn=conn)
+
+        tasks = [asyncio.create_task(winner()), asyncio.create_task(loser())]
+        await asyncio.sleep(0.3)
+        assert "loser" not in seen  # still waiting for the lock
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=20)
+        assert seen == {"winner": 0, "loser": 1}
+
+        v = ScriptVersion(
+            id=new_id("script_version"), script_item_id=item.id, version=1, spoken_text="a"
+        )
+        await repos.versions.insert(v)
+        clash = ScriptVersion(
+            id=new_id("script_version"), script_item_id=item.id, version=1, spoken_text="b"
+        )
+        with pytest.raises(StaleRevisionError):
+            await repos.versions.insert(clash)
     finally:
         await repos.close()
 

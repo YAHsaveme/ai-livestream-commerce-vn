@@ -9,11 +9,15 @@ retry, response parsing, and typed transport errors. No model-engine code.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 import httpx
+from .stream_deadline import FIRST_CONTENT_TIMEOUT_S, TOTAL_TIMEOUT_S, StreamDeadline
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClientError(RuntimeError):
@@ -51,6 +55,8 @@ class ChatRequest:
     stop: list[str] = field(default_factory=list)
     seed: int = 42
     stream: bool = False
+    # Ask the provider for token usage in the final stream chunk (cost evidence, M7.3).
+    include_usage: bool = False
 
 
 class OpenAICompatibleClient:
@@ -69,16 +75,37 @@ class OpenAICompatibleClient:
         timeout: float = 60.0,
         max_retries: int = 0,
         http_client: Optional[httpx.Client] = None,
+        total_timeout: float = TOTAL_TIMEOUT_S,
+        first_content_timeout: float = FIRST_CONTENT_TIMEOUT_S,
     ) -> None:
         base = (base_url or os.environ.get("LLM_BASE_URL", "") or "").strip()
         if not base:
             raise LLMClientError("OpenAICompatibleClient needs base_url or env LLM_BASE_URL")
         self._base_url = base.rstrip("/")
+        # Providers differ in path: default {base}/v1/chat/completions; Gemini's OpenAI-compatible
+        # endpoint is {base}/chat/completions, so LLM_CHAT_PATH=/chat/completions selects it.
+        chat_path = (os.environ.get("LLM_CHAT_PATH", "") or "/v1/chat/completions").strip()
+        self._chat_url = f"{self._base_url}/{chat_path.lstrip('/')}"
+        # Reasoning models bill hidden thinking tokens as output; "low"/"none" cuts cost and
+        # latency for short script lines. Unset = provider default.
+        self._reasoning_effort = (os.environ.get("LLM_REASONING_EFFORT", "") or "").strip()
+        # Some providers reject standard fields they do not know (Gemini: "seed" -> HTTP 400).
+        omit = os.environ.get("LLM_OMIT_PARAMS", "") or ""
+        # model/messages/stream define the call itself (stream is restored for SSE), so they stay.
+        self._omit_params = {name.strip() for name in omit.split(",") if name.strip()} - {
+            "model",
+            "messages",
+            "stream",
+        }
         self._api_key = api_key or os.environ.get("LLM_AUTH_TOKEN", "") or ""
         self._model = model or os.environ.get("LLM_MODEL", "") or ""
         self._timeout = float(timeout)
         self._max_retries = int(max_retries)
         self._client = http_client
+        self._total_timeout = min(float(total_timeout), self._timeout)
+        self._first_content_timeout = min(float(first_content_timeout), self._total_timeout)
+        # stream_options rejected once by this server: never sent again (tokens stay unknown)
+        self._usage_rejected = False
 
     def _get_client(self) -> httpx.Client:
         if self._client is None:
@@ -101,16 +128,30 @@ class OpenAICompatibleClient:
             "top_p": req.top_p,
             "stream": req.stream,
         }
+        if self._reasoning_effort:
+            if (
+                self._reasoning_effort.lower() == "none"
+                and str(body["model"]).lower().startswith("qwen")
+                and "/compatible-mode" in self._base_url
+            ):
+                # DashScope hybrid Qwen uses a boolean switch, not OpenAI's effort enum.
+                body["enable_thinking"] = False
+            else:
+                body["reasoning_effort"] = self._reasoning_effort
         if req.stop:
             body["stop"] = req.stop
         if req.seed:
             body["seed"] = req.seed
+        if req.include_usage and not self._usage_rejected:
+            body["stream_options"] = {"include_usage": True}
+        for name in self._omit_params:
+            body.pop(name, None)
         return body
 
     def chat(self, req: ChatRequest) -> LLMResult:
         """Blocking chat completion. Returns the full response."""
         client = self._get_client()
-        url = f"{self._base_url}/v1/chat/completions"
+        url = self._chat_url
         body = self._build_body(req)
         last_error: Optional[Exception] = None
         for attempt in range(max(1, self._max_retries + 1)):
@@ -122,7 +163,11 @@ class OpenAICompatibleClient:
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                detail = (resp.text or "")[:300]
+                try:
+                    resp.read()  # a streaming error body is unread until now
+                    detail = (resp.text or "")[:300]
+                except httpx.HTTPError:
+                    detail = ""
                 raise LLMClientError(f"LLM chat: HTTP {resp.status_code} {detail}") from exc
             data = resp.json() if resp.content else {}
             choices = data.get("choices", [])
@@ -131,8 +176,18 @@ class OpenAICompatibleClient:
             choice = choices[0]
             message = choice.get("message", {}) if isinstance(choice, dict) else {}
             text = message.get("content", "") if isinstance(message, dict) else ""
+            text = text if isinstance(text, str) else ""
             finish = choice.get("finish_reason", "stop") if isinstance(choice, dict) else "stop"
             usage = data.get("usage", {}) or {}
+            if not text.strip() or finish == "length":
+                reasoning = message.get("reasoning_content") if isinstance(message, dict) else None
+                logger.warning(
+                    "LLM incomplete content finish=%s completion_tokens=%s reasoning_chars=%s chars=%s",
+                    finish,
+                    usage.get("completion_tokens"),
+                    len(reasoning) if isinstance(reasoning, str) else 0,
+                    len(text),
+                )
             return LLMResult(
                 text=text,
                 finish_reason=finish,
@@ -142,37 +197,96 @@ class OpenAICompatibleClient:
             )
         raise LLMClientError(f"LLM chat failed after retries: {last_error}") from last_error
 
-    def chat_stream(self, req: ChatRequest) -> Iterator[str]:
-        """Streaming chat completion. Yields text deltas."""
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def chat_stream(self, req: ChatRequest, usage: Optional[dict] = None) -> Iterator[str]:
+        """Streaming chat completion. Yields text deltas.
+
+        ``usage``, when given, receives ``prompt_tokens``/``completion_tokens`` only if the
+        provider reports them (never estimated).
+        """
         client = self._get_client()
-        url = f"{self._base_url}/v1/chat/completions"
+        url = self._chat_url
         body = self._build_body(req)
         body["stream"] = True
-        try:
-            with client.stream("POST", url, json=body, headers=self._headers()) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith("data: "):
-                        payload = line[6:].strip()
-                        if payload == "[DONE]":
-                            break
+        started = False
+        yield from self._chat_stream_guarded(client, url, body, usage, started)
+
+    def _chat_stream_guarded(self, client, url, body, usage, started):
+        while True:
+            deadline = StreamDeadline(self._total_timeout, self._first_content_timeout)
+            content_chars, reasoning_chars, finish = 0, 0, None
+            try:
+                deadline.check()
+                with client.stream(
+                    "POST",
+                    url,
+                    json=body,
+                    headers=self._headers(),
+                    timeout=deadline.http_timeout(self._timeout),
+                ) as resp:
+                    if resp.status_code >= 400:
                         try:
-                            chunk = json.loads(payload)
-                            choices = chunk.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                        except json.JSONDecodeError:
+                            resp.read()  # inside the with: the body is gone once it closes
+                        except httpx.HTTPError:
+                            pass
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        deadline.check()
+                        if not line or line.startswith(":"):
                             continue
-        except httpx.RequestError as exc:
-            raise LLMClientError(f"LLM chat stream failed: {exc}") from exc
-        except httpx.HTTPStatusError as exc:
-            detail = (resp.text or "")[:300]
-            raise LLMClientError(f"LLM chat stream: HTTP {resp.status_code} {detail}") from exc
+                        if line.startswith("data: "):
+                            payload = line[6:].strip()
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(payload)
+                                reported = chunk.get("usage")
+                                if usage is not None and isinstance(reported, dict):
+                                    usage.update(
+                                        prompt_tokens=reported.get("prompt_tokens"),
+                                        completion_tokens=reported.get("completion_tokens"),
+                                    )
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    finish = choices[0].get("finish_reason") or finish
+                                    delta = choices[0].get("delta", {})
+                                    reasoning = delta.get("reasoning_content")
+                                    if isinstance(reasoning, str):
+                                        reasoning_chars += len(reasoning)
+                                    content = delta.get("content", "")
+                                    if isinstance(content, str) and content:
+                                        deadline.content.set()
+                                        started = True
+                                        content_chars += len(content)
+                                        yield content
+                            except json.JSONDecodeError:
+                                continue
+                if not started or finish == "length":
+                    logger.warning(
+                        "LLM incomplete stream finish=%s reasoning_chars=%s chars=%s",
+                        finish,
+                        reasoning_chars,
+                        content_chars,
+                    )
+                return
+            except TimeoutError as exc:
+                raise LLMClientError("LLM stream deadline exceeded or cancelled") from exc
+            except httpx.RequestError as exc:
+                raise LLMClientError(f"LLM chat stream failed: {exc}") from exc
+            except httpx.HTTPStatusError as exc:
+                if resp.status_code in (400, 422) and "stream_options" in body and not started:
+                    # The live call must not fail because of cost evidence: retry once without it.
+                    self._usage_rejected = True
+                    body.pop("stream_options")
+                    continue
+                try:
+                    detail = (resp.text or "")[:300]
+                except httpx.HTTPError:
+                    detail = ""
+                raise LLMClientError(f"LLM chat stream: HTTP {resp.status_code} {detail}") from exc
 
     def close(self) -> None:
         if self._client is not None:

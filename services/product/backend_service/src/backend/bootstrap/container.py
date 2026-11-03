@@ -67,6 +67,30 @@ class BootstrapContainer:
     # and the session binding endpoint (task 12.2). When None, the
     # /script-sets and session binding surfaces return 501.
     script_authoring_service: Any = None
+    approved_speech: Any = None
+
+    # -- P0-FB-019 durable terminal record + outbox (DISABLED slice) --
+    # TerminalOutcomes or None. Set by the lifespan only when
+    # TERMINAL_OUTCOMES_ENABLED and a durable store, URL and secret exist.
+    terminal_outcomes: Any = None
+    terminal_outbox_task: Any = None  # asyncio.Task or None (set by the lifespan)
+
+    # -- P0-FB-018 S6 budget-lease expiry watcher (DISABLED by default) --
+    budget_lease_enforcer: Any = None
+    budget_lease_task: Any = None  # asyncio.Task or None (set by the lifespan)
+
+    # P0-FB-020 R1 (default off): no capability or readiness gate.
+    runtime_failures: Any = None
+    runtime_failures_task: Any = None
+    avatar_lifecycle_task: Any = None
+    media_cleanup_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # -- P0-FB-017 durable signed usage evidence (default OFF, fail closed) --
+    # UsageEvidence or None. Set by the lifespan only when USAGE_EVIDENCE_ENABLED and a
+    # connected Postgres store, the exact receiver URL and a secret all exist.
+    usage_evidence: Any = None
+    usage_sender: Any = None  # UsageSender or None
+    usage_evidence_task: Any = None  # asyncio.Task or None (set by the lifespan)
 
     # -- Canonical multi-platform event ingress (multi-platform change) --
     # PlatformEventIngestionService or None. When None, the /events endpoint

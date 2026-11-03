@@ -9,6 +9,7 @@ Dependencies come from the typed ``BootstrapContainer`` via
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 import os
 
@@ -17,16 +18,60 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from backend.application.clients.avatar.image_url import check_image_url
 from backend.api.dependencies import container_from_request
-from backend.application.db.session_store import SessionLockTimeout
+from backend.application.db.session_store import SessionLockTimeout, delete_owned
+from backend.application.execution_contract import rescue_switch_on
+from backend.application.script_authoring.approved_speech import SpeechRejected
 
 from . import router
+from .terminal_guard import (
+    register_terminal_execution,
+    teardown_then_persist,
+    terminal_retry_pending,
+)
 from .router import logger
 from .router import router as _router  # noqa: F401
 
 
 def _container(request: Request):
     return container_from_request(request)
+
+
+def _authenticated_internal_caller(request: Request, config: Any) -> bool:
+    """Per-session avatar/voice overrides need the viewer bearer AND a separate internal secret.
+
+    The viewer token is handed to browsers, so on its own it must never choose a provider agent or a voice.
+    ``viewer_auth`` stays unchanged for legacy session starts, including unauthenticated local development, and
+    overrides never inherit that development bypass. Without AVATAR_INTERNAL_TOKEN overrides are refused.
+    """
+    from backend.api.security.authentication import parse_bearer, tokens_match
+
+    viewer = (getattr(config, "backend_api_token", "") or "").strip()
+    internal = (getattr(config, "avatar_internal_token", "") or "").strip()
+    bearer = parse_bearer(request.headers.get("authorization"))
+    header = (request.headers.get("x-livento-internal-token") or "").strip()
+    return bool(
+        viewer
+        and internal
+        and bearer
+        and header
+        and tokens_match(bearer, viewer)
+        and tokens_match(header, internal)
+    )
+
+
+def _validate_image_host(image_url: str, config: Any) -> None:
+    hosts = (getattr(config, "avatar_image_hosts", "") or "").split(",")
+    try:
+        check_image_url(image_url, hosts)
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail={"code": "avatar_image_host_not_allowed"}
+        ) from None
+
+
+from backend.application.session_tts import SessionTTS as _SessionTTS  # noqa: E402
 
 
 @_router.post("/sessions")
@@ -50,17 +95,63 @@ async def sessions_start(
         ):
             raise HTTPException(status_code=409, detail={"code": "unsupported_capability"})
 
+    if req.has_avatar_or_voice_override() and not _authenticated_internal_caller(request, d.config):
+        raise HTTPException(status_code=403, detail={"code": "avatar_override_not_authorized"})
+    if req.host_name is not None and (
+        not req.execution_contract or not _authenticated_internal_caller(request, d.config)
+    ):
+        raise HTTPException(status_code=403, detail={"code": "host_identity_not_authorized"})
+    override_mode = getattr(d.backend, "avatar_override_mode", None)
+    if req.has_avatar_or_voice_override() and override_mode not in (
+        "avatar_and_voice",
+        "voice_only",
+    ):
+        # a renderer that declares nothing cannot honour the choice: acknowledging would show the wrong avatar
+        raise HTTPException(
+            status_code=422, detail={"code": "avatar_override_unsupported_renderer"}
+        )
+    if req.has_avatar_or_voice_override() and override_mode == "voice_only":
+        logger.warning(
+            "avatar_override_voice_only renderer=%s: the avatar choice is ignored, the voice is applied",
+            getattr(d.backend, "name", "?"),
+        )
+    if req.avatar_image_url is not None:
+        _validate_image_host(req.avatar_image_url, d.config)
+
+    from backend.application.usage_evidence.cost import cost_meter
+
+    # An avatar opened while the backend starts already knows its identity (the contextvar is
+    # copied into the worker thread), so a start that fails after the provider session was
+    # created is still costed.
+    expect = (
+        cost_meter.expect(req.tenant_id, req.business_session_id, req.generation)
+        if req.execution_contract
+        else None
+    )
     try:
         result = await asyncio.to_thread(
             d.backend.start,
-            StartOptions(avatar_id=req.avatar_id, is_sandbox=req.is_sandbox),
+            StartOptions(
+                avatar_id=req.avatar_id,
+                avatar_provider=req.avatar_provider,
+                avatar_agent_id=req.avatar_agent_id,
+                avatar_image_url=req.avatar_image_url,
+                voice_id=req.voice_id,
+                is_sandbox=req.is_sandbox,
+            ),
         )
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        cost_meter.expect_reset(expect)
 
     meta: dict[str, Any] = {"status": "active", "mode": result.mode}
+    if req.host_name is not None:
+        meta["host_name"] = req.host_name
+    if req.voice_id is not None:
+        meta["voice_id"] = req.voice_id
     if req.execution_contract:
         meta["execution_contract"] = {
             "tenant_id": req.tenant_id,
@@ -73,15 +164,57 @@ async def sessions_start(
             "first_ai_broadcast": False,
         }
         meta["execution_command_outcomes"] = {}
-    await d.store.set(result.session_id, meta)
+        if req.rescue_commands and rescue_switch_on():  # start-time only
+            # Per-session gate; capabilities/commands/legacy guard all read it.
+            meta["p0_rescue"] = True
+    try:
+        await _register_started_session(d, result.session_id, meta, req, cost_meter)
+    except BaseException:
+        # start has allocated paid media. Keep a receipt even if the metadata
+        # write succeeded remotely but its acknowledgement was lost.
+        receipts = _media_receipts(d)
+        receipts[result.session_id] = {"stopped": False, "prepare_meta": meta}
+        d.approved_speech.cancel(result.session_id)
+        try:
+            await asyncio.shield(_release_media(d, result.session_id))
+        except BaseException:
+            logger.error("prepare rollback deferred session=%s", result.session_id)
+        raise
+    out = result.public_dict()  # frontend-safe only
+    if req.has_avatar_or_voice_override():
+        out["avatar_override_applied"] = True
+        out["avatar_applied"] = override_mode == "avatar_and_voice"
+    if req.rescue_commands:
+        out["rescue_commands"] = bool(meta.get("p0_rescue"))
+    return out
+
+
+async def _register_started_session(d, session_id, meta, req, cost_meter):
+    await d.store.set(session_id, meta)
+    if req.execution_contract:
+        from backend.application.execution_contract import ExecutionIdentity
+
+        cost_meter.bind(
+            session_id,
+            ExecutionIdentity(
+                tenant_id=req.tenant_id,
+                business_session_id=req.business_session_id,
+                runtime_session_id=session_id,
+                generation=req.generation,
+            ),
+        )
+    await register_terminal_execution(d, session_id, meta)
+    failures = getattr(d, "runtime_failures", None)
+    if failures is not None:
+        failures.register(session_id, meta)
     if d.livekit_publishers is not None:
-        d.livekit_publishers.activate(result.session_id)
+        d.livekit_publishers.activate(session_id)
     if d.pg_store is not None and getattr(d.pg_store, "enabled", False):
         try:
             await d.pg_store.upsert_session(
-                result.session_id,
+                session_id,
                 status="active",
-                mode=result.mode,
+                mode=meta["mode"],
                 render_backend=d.config.render_backend if d.config else None,
                 avatar_id=req.avatar_id,
             )
@@ -90,9 +223,8 @@ async def sessions_start(
         except Exception:
             logger.warning(
                 "Postgres persistence failed session=%s operation=upsert_session",
-                result.session_id,
+                session_id,
             )
-    return result.public_dict()  # frontend-safe only
 
 
 @_router.post("/sessions/{session_id}/say")
@@ -109,14 +241,78 @@ async def sessions_say(
     )
 
 
+async def _reject_p0_direct_say(d: Any, req: router.SayReq) -> None:
+    """P0-FB-015 D2: direct say is disabled for P0 sessions.
+
+    The selector is server-owned session meta, never request data. Runs before
+    the safety screen, the LLM and the approved-speech boundary.
+    """
+    meta = await d.store.get(req.session_id)
+    if not (meta and meta.get("execution_contract")):
+        return
+    # Structured audit line: no text, no secrets.
+    logger.warning(
+        "audit_event=direct_input_rejected reason=direct_input_disabled "
+        "route=direct_say session=%s generate=%s",
+        req.session_id,
+        bool(req.generate),
+    )
+    pg = d.pg_store
+    if pg is not None and getattr(pg, "enabled", False):
+        try:
+            await pg.insert_audit_event(
+                "direct_input.rejected",
+                session_id=req.session_id,
+                actor="operator",
+                resource="direct_say",
+                detail={"reason": "direct_input_disabled", "generate": bool(req.generate)},
+            )
+        except Exception:
+            logger.warning(
+                "Postgres persistence failed session=%s operation=insert_audit_event",
+                req.session_id,
+            )
+    raise HTTPException(status_code=409, detail={"code": "direct_input_disabled"})
+
+
 async def _say(request: Request, req: router.SayReq) -> dict[str, Any]:
     d = _container(request)
     from backend.application.render.engines_base import FullPipelineBackend, StreamingAvatarBackend
 
+    await _reject_p0_direct_say(d, req)
+    boundary = d.approved_speech
+    if req.generate:
+        # Active direct generation is another input to the LLM. Reuse the
+        # canonical gate and session replay window, never synthesize an API
+        # approval or turn this operator request into a canonical viewer event.
+        if d.event_ingestion is None:
+            raise HTTPException(status_code=409, detail={"code": "safety_gate_unavailable"})
+        try:
+            evidence = await d.event_ingestion.screen_direct_generation(req.session_id, req.text)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown session_id")
+        except SessionLockTimeout:
+            raise HTTPException(status_code=503, detail="session busy")
+        if not evidence["accepted"]:
+            raise HTTPException(
+                status_code=409, detail={"code": "unsafe_input", "details": {"safety": evidence}}
+            )
+    try:
+        speech = await boundary.prepare(
+            req.session_id,
+            req.text,
+            generate=req.generate,
+            llm=getattr(d.engine_manager, "llm", None),
+            route="direct_say",
+        )
+    except SpeechRejected as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+    req = req.model_copy(update={"text": speech.text, "generate": False})
+
     # Phase E: streaming coordinator path for StreamingAvatarBackend (mock +
     # future self-host). FullPipelineBackend (cloud) keeps backend.say().
     if isinstance(d.backend, StreamingAvatarBackend):
-        return await _streaming_say(d, req)
+        return await _streaming_say(d, req, speech=speech)
     if not isinstance(d.backend, FullPipelineBackend):
         raise HTTPException(status_code=501, detail="backend does not support say()")
     # Cloud / FullPipelineBackend path.
@@ -129,7 +325,17 @@ async def _say(request: Request, req: router.SayReq) -> dict[str, Any]:
     if d.hub is not None:
         await d.hub.emit(sid, {"type": "avatar.speak_started", "text": req.text})
     try:
-        reply = await asyncio.to_thread(d.backend.say, sid, req.text, req.generate)
+        await boundary.revalidate(speech)
+        if d.hub is not None:
+            await d.hub.emit(sid, {"type": "speech.content_validated", **speech.evidence()})
+
+        def cloud_say():
+            boundary.check_live(speech, lambda: True)
+            return d.backend.say(sid, speech.text, False)
+
+        reply = await asyncio.to_thread(cloud_say)
+    except SpeechRejected as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
     except KeyError:
         raise HTTPException(status_code=404, detail="unknown session_id")
     except NotImplementedError as exc:
@@ -138,10 +344,10 @@ async def _say(request: Request, req: router.SayReq) -> dict[str, Any]:
         d.locks.release(sid)
     if d.hub is not None:
         await d.hub.emit(sid, {"type": "avatar.speak_ended", "reply": reply})
-    return {"ok": True, "reply": reply}
+    return {"ok": True, "reply": reply, "validation": speech.evidence()}
 
 
-async def _streaming_say(d: Any, req: router.SayReq) -> dict[str, Any]:
+async def _streaming_say(d: Any, req: router.SayReq, *, speech=None) -> dict[str, Any]:
     """Run the LLM->chunker->TTS->backend streaming coordinator for one turn.
 
     Per-session lock: if a turn is already running for this session, reject
@@ -158,6 +364,8 @@ async def _streaming_say(d: Any, req: router.SayReq) -> dict[str, Any]:
     from tts.engines.base import TTSEngine, ToneEngine
 
     sid = req.session_id
+    if speech is None:
+        raise HTTPException(status_code=409, detail={"code": "missing_speech_validation"})
     if not d.locks.try_acquire(sid):
         raise HTTPException(status_code=409, detail="already_speaking")
 
@@ -167,6 +375,9 @@ async def _streaming_say(d: Any, req: router.SayReq) -> dict[str, Any]:
     em = d.engine_manager
     llm: LLMEngine = em.llm if (em is not None and em.llm is not None) else _NoopEngine()
     tts: TTSEngine = em.tts if (em is not None and em.tts is not None) else ToneEngine()
+    session_meta = await d.store.get(sid)
+    if session_meta and session_meta.get("voice_id") is not None:
+        tts = _SessionTTS(tts, voice_id=session_meta.get("voice_id"))
 
     # Bounded queue + metrics for this utterance. The chunking config is
     # built ONCE from AppConfig into the typed configs the orchestrator
@@ -190,31 +401,38 @@ async def _streaming_say(d: Any, req: router.SayReq) -> dict[str, Any]:
     # deliberately owns no policy-mode selection (Change A contract).
     chunk_policy = os.environ.get("TEXT_CHUNK_POLICY", ChunkPolicy.ADAPTIVE_VI.value)
     try:
+
+        async def emit(sid, event):
+            if d.hub is not None:
+                await d.hub.emit(sid, event)
+
         orchestrator = StreamOrchestrator(
             llm=llm,
-            tts=tts,
+            tts=d.approved_speech.guarded_tts(
+                speech,
+                tts,
+                live=lambda: True,
+                emit=emit,
+            ),
             backend=d.backend,
             queue=queue,
             metrics=metrics,
             fixed_config=fixed_config,
             controller_config=controller_config,
             chunk_policy=chunk_policy,
-            audio_window_callback=d.livekit_publishers.publish
-            if d.livekit_publishers is not None
-            else None,
+            audio_window_callback=d.approved_speech.guarded_audio(
+                speech,
+                live=lambda: True,
+                callback=d.livekit_publishers.publish if d.livekit_publishers is not None else None,
+            ),
         )
         # Register the orchestrator so /sessions/{id}/interrupt can cancel it.
         d.orchestrators[sid] = {"orchestrator": orchestrator, "queue": queue}
 
         if d.hub is not None:
             await d.hub.emit(sid, {"type": "avatar.speak_started", "text": req.text})
-        if req.generate:
-            system_prompt = None
-            if em is not None and hasattr(em, "_system_prompt"):
-                system_prompt = em._system_prompt or None
-            spoken = await orchestrator.run(sid, req.text, system_prompt=system_prompt)
-        else:
-            spoken = await orchestrator.speak_verbatim(sid, req.text)
+        await d.approved_speech.revalidate(speech)
+        spoken = await orchestrator.speak_verbatim(sid, speech.text)
         # Drain the queue: emit one WS event per VideoWindow to the control
         # hub so connected clients see frame updates. In production the MEDIA
         # plane carries the actual video; this control event is for telemetry.
@@ -239,7 +457,10 @@ async def _streaming_say(d: Any, req: router.SayReq) -> dict[str, Any]:
             "reply": spoken,
             "windows": windows_emitted,
             "metrics": metrics.to_dict(),
+            "validation": speech.evidence(),
         }
+    except SpeechRejected as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
     except KeyError:
         raise HTTPException(status_code=404, detail="unknown session_id")
     finally:
@@ -254,6 +475,12 @@ async def sessions_interrupt(
     _: None = Depends(router.viewer_auth),
 ) -> dict[str, Any]:
     d = _container(request)
+    from .execution import use_execution_command
+
+    # P0-FB-016: a P0 session is interrupted only by an audited command.
+    if await use_execution_command(d, session_id):
+        raise HTTPException(status_code=409, detail={"code": "use_execution_command"})
+    d.approved_speech.cancel(session_id)
     # Task 8: if there is an active streaming orchestrator for this session,
     # cancel it first (stops emission + drains the bounded queue).
     try:
@@ -272,6 +499,16 @@ async def sessions_interrupt(
     return {"ok": True}
 
 
+def _internal_cleanup(request: Request) -> bool:
+    from backend.api.security.authentication import tokens_match
+
+    # Fail closed in every env: an empty admin token never accepts the header
+    # (config refuses to boot with the rescue switch on and no admin token).
+    token = request.app.state.container.config.admin_api_token.strip()
+    presented = request.headers.get("x-livento-internal-cleanup", "")
+    return bool(token and presented and tokens_match(presented, token))
+
+
 @_router.post("/sessions/{session_id}/stop")
 async def sessions_stop(
     session_id: str,
@@ -279,27 +516,181 @@ async def sessions_stop(
     _: None = Depends(router.viewer_auth),
 ) -> dict[str, Any]:
     d = _container(request)
+    from .execution import use_execution_command
+
+    # P0-FB-016: on a marked P0 session legacy stop bypasses End/Emergency
+    # truth; only the API's internal cleanup (admin token in a dedicated
+    # header the viewer plane cannot supply) may use it.
+    if await use_execution_command(d, session_id) and not _internal_cleanup(request):
+        raise HTTPException(status_code=409, detail={"code": "use_execution_command"})
+    return await stop_session_internal(d, session_id)
+
+
+async def stop_session_internal(d: Any, session_id: str) -> dict[str, Any]:
+    """The whole /stop effect, shared with lease-expiry completion. Idempotent."""
+    d.approved_speech.cancel(session_id)
+    # Disconnect paid media BEFORE Redis, ingestion reconciliation or receipts.
+    # The lifecycle sweeper retains this work until metadata settlement succeeds.
+    await _release_media(d, session_id)
+    cleanup = getattr(d.approved_speech, "cleanup", None)
+    if cleanup is not None and (d.coordinator is None or not d.coordinator.has(session_id)):
+        cleanup(session_id)
     # Wave 2: stop the DirectorCoordinator for this session (before teardown).
     if d.coordinator is not None and d.coordinator.has(session_id):
-        d.coordinator.stop(session_id)
+        # stop() returns the delivery counter as of teardown; comments that
+        # were routed but never consumed die with the dropped queue, so
+        # reconcile them as audited non_deliverable (P0-FB-013).
+        attach_seq = d.coordinator.stop(session_id)
+        ingestion = getattr(d, "event_ingestion", None)
+        if ingestion is not None:
+            reconciled = await ingestion.reconcile_session(session_id, attach_seq=attach_seq)
+            if reconciled:
+                logger.info(
+                    "session.stop reconciled non-deliverable events session=%s count=%d",
+                    session_id,
+                    len(reconciled),
+                )
+    # Cancellation above is immediate. Serialize teardown with 007's start
+    # receipt writes so a late save cannot resurrect deleted session metadata.
+    from .execution import _locked
+
+    async with _locked(d.store, session_id) as fence:
+        result = await _stop_cancelled_session(d, session_id, fence)
+    # The terminal record may be complete while the provider still bills: the
+    # receipt (retry obligation) goes away only once media is confirmed stopped.
+    if _media_receipts(d).get(session_id, {}).get("stopped"):
+        _media_receipts(d).pop(session_id, None)
+    return result
+
+
+def _media_receipts(d: Any) -> dict:
+    receipts = getattr(d, "media_cleanup_pending", None)
+    if receipts is None:
+        receipts = d.media_cleanup_pending = {}
+    return receipts
+
+
+async def _release_media(d: Any, session_id: str) -> None:
+    receipts = _media_receipts(d)
+    receipt = receipts.setdefault(session_id, {"stopped": False})
+    if receipt["stopped"]:
+        return
     entry = d.orchestrators.get(session_id)
     if entry is not None:
-        orchestrator = entry["orchestrator"]
-        await orchestrator.cancel(session_id)
+        await entry["orchestrator"].cancel(session_id)
+    receipt["inflight"] = True  # the lifecycle sweeper must not treat this wait as a failure
     try:
         await asyncio.to_thread(d.backend.stop, session_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail="unknown session_id")
-    if d.livekit_publishers is not None:
-        await d.livekit_publishers.stop(session_id)
-    if d.director is not None:
-        d.director.detach(session_id)
-    await d.store.delete(session_id)
+        # Preserve legacy unknown-session behavior unless this is a retry or
+        # rollback of a known allocation whose stop result was ambiguous.
+        from backend.application.budget_lease import termination_pending
+
+        if (
+            not receipt.get("attempted")
+            and not receipt.get("prepare_meta")
+            and not await terminal_retry_pending(d, session_id)
+            and not await termination_pending(d, session_id)
+        ):
+            receipts.pop(session_id, None)
+            raise HTTPException(status_code=404, detail="unknown session_id") from None
+        receipt["stopped"] = True
+    except Exception as exc:
+        receipt["attempted"] = True
+        receipt["error"] = type(exc).__name__
+        logger.error(
+            "media cleanup deferred session=%s error_type=%s", session_id, type(exc).__name__
+        )
+    else:
+        receipt["stopped"] = True
+    finally:
+        receipt["inflight"] = False
+    if receipt["stopped"]:
+        receipt.pop("error", None)
+        from backend.application.usage_evidence.cost import cost_meter
+
+        cost_meter.unbind(session_id)
+
+
+async def _stop_cancelled_session(d: Any, session_id: str, fence: Any = None) -> dict[str, Any]:
+    failure_monitor = getattr(d, "runtime_failures", None)
+    if failure_monitor is not None and session_id in failure_monitor.pending:
+        from .execution import _load
+
+        meta, state = await _load(d.store, session_id)
+        await failure_monitor.persist_pending_locked(session_id, meta, state, fence)
+    await _release_media(
+        d, session_id
+    )  # cancels the orchestrator, then stops media; no-op once stopped
+    backend_error = _media_receipts(d).get(session_id, {}).get("error")
+    if backend_error and getattr(d, "terminal_outcomes", None) is None:
+        raise HTTPException(status_code=503, detail={"code": "media_cleanup_retry", "retry": True})
+    from backend.application.budget_lease import keep_for_unstaged
+
+    # Media cleanup and the 019 terminal record come FIRST and are never blocked by usage
+    # evidence. A terminal usage fact that could not be staged keeps ONLY the meta (the
+    # watcher retries it); everything else is released as before.
+    await teardown_then_persist(d, session_id, fence, backend_error)
+    if await keep_for_unstaged(d, session_id, fence):
+        return {"ok": True, "stopped": session_id}
+    await delete_session_meta(d, session_id, fence)
+    return {"ok": True, "stopped": session_id}
+
+
+async def _update_meta(d: Any, session_id: str, **fields: Any) -> None:
+    """Merge fields into the session meta under the session lock (re-read inside it).
+
+    EVERY writer of the session meta holds the session lock: the usage-evidence commit proof,
+    the deferred facts and the execution state live in that one record, and an unlocked
+    read-modify-write could rewind them.
+    """
+    from .execution import _load_meta, _locked, _save
+
+    async with _locked(d.store, session_id) as fence:
+        meta = await _load_meta(d.store, session_id)
+        meta.update(fields)
+        await _save(d.store, session_id, meta, fence)
+
+
+async def delete_session_meta(d: Any, session_id: str, fence: Any = None) -> None:
+    from backend.application.usage_evidence.sender import CLEANUP_KEY
+
+    from .execution import _save
+
+    sender = getattr(d, "usage_sender", None)
+    keep_meta = False
+    if sender is not None:
+        # The session meta holds the only commit proof of unresolved usage evidence rows:
+        # resolve them (we hold the session lock) BEFORE it is deleted. If any remain (or
+        # the outbox errors) KEEP the meta; the sweeper deletes it once they are resolved.
+        try:
+            unresolved = await sender.resolve_session(session_id, fence)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("usage evidence resolve failed at stop session=%s", session_id)
+            unresolved = 1
+        if unresolved:
+            try:
+                meta = copy.deepcopy(await d.store.get(session_id))
+                if meta is not None:
+                    meta[CLEANUP_KEY] = True
+                    await _save(d.store, session_id, meta, fence)
+                    sender.track(session_id)
+            except Exception:
+                logger.error("usage evidence cleanup marker failed session=%s", session_id)
+            logger.error(
+                "session meta KEPT at stop: %d unresolved usage evidence rows session=%s",
+                unresolved,
+                session_id,
+            )
+            keep_meta = True
+    if not keep_meta:
+        await delete_owned(d.store, session_id, fence)  # never under a lost lease
     if d.hub is not None:
         await d.hub.emit(session_id, {"type": "session.stopped"})
     # P4 hardening: drop the per-session lock entry to prevent memory leak.
     d.locks.drop(session_id)
-    return {"ok": True, "stopped": session_id}
 
 
 # ── Director-driven endpoints (orchestration) ───────────────────────
@@ -326,6 +717,15 @@ async def sessions_attach(
             raise HTTPException(status_code=409, detail="platform_event_binding_conflict")
     products = [p.to_entity() for p in req.products]
     shop_profile = req.shop_profile_text()
+    meta = await d.store.get(session_id) or {}
+    envelope = None
+    if meta.get("execution_contract") or meta.get("script_set_binding"):
+        try:
+            envelope = await d.approved_speech.resolve(session_id)
+        except SpeechRejected as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        products = envelope.catalog()
+        shop_profile = ""
     # Re-attach updates the existing runtime/coordinator atomically. Stopping
     # the coordinator here would erase the active checkpoint and rolling window.
     has_coordinator = d.coordinator is not None and d.coordinator.has(session_id)
@@ -340,15 +740,17 @@ async def sessions_attach(
             session_id,
             products,
             shop_profile=shop_profile,
-            run_plan=router.build_run_plan(req.products, persona=shop_profile),
+            run_plan=None
+            if envelope
+            else router.build_run_plan(req.products, persona=shop_profile),
             runtime_config=runtime_values,
         )
+        if envelope is not None:
+            d.director.get_session(session_id).bind_envelope(envelope)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if binding is not None:
-        meta = dict(await d.store.get(session_id) or {})
-        meta["platform_event_binding"] = binding
-        await d.store.set(session_id, meta)
+        await _update_meta(d, session_id, platform_event_binding=binding)
     # M3: freeze the product snapshot into the runtime DB (fire-and-forget).
     # The snapshot stores the entity document JSON so persisted rows and the
     # accepted snapshot share one shape (id/name/price columns + full payload).
@@ -383,7 +785,26 @@ async def sessions_attach(
             )
         else:
             d.coordinator.update_catalog(session_id, products)
+        _configure_reducer_mode(d, session_id, meta, products)
     return {"ok": True, "will_speak": False, **info}
+
+
+def _configure_reducer_mode(d: Any, session_id: str, meta: dict, products) -> None:
+    """Select the decision input for this session and bind its catalog.
+
+    A P0 session (one carrying an ``execution_contract``) is fed by the bounded
+    reducer; a legacy session keeps the raw-comment feed verbatim. This is a
+    Runtime engineering selector, not a Product Rule, and it is inert for
+    legacy sessions.
+    """
+    if d.reducer is None:
+        return
+    if not meta.get("execution_contract"):
+        return
+    d.coordinator.live_follow.bind(session_id, meta["execution_contract"])
+    current = products[0].id if products else None
+    d.reducer.set_session_catalog(session_id, list(products), current)
+    d.coordinator.set_reducer_mode(session_id, True)
 
 
 @_router.patch("/sessions/{session_id}/config")
@@ -432,7 +853,9 @@ async def sessions_events(
     if service is None:
         raise HTTPException(status_code=501, detail="event ingestion not enabled")
     try:
-        return await service.ingest(session_id, req.events)
+        return await service.ingest(
+            session_id, req.events, delivery_outcomes_v1=req.delivery_outcomes_v1
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="unknown session_id")
     except SessionLockTimeout:
@@ -454,9 +877,7 @@ async def sessions_plan_create(
     body = req or router.PlanCreateReq()
     plan = router.build_run_plan(body.products, persona=body.persona)
     plan_dict = plan.model_dump()
-    meta = dict(meta)
-    meta["run_plan"] = plan_dict
-    await d.store.set(session_id, meta)
+    await _update_meta(d, session_id, run_plan=plan_dict)
 
     # If director runtime has the session, attach plan + reset cursor.
     if d.director is not None and d.director.has(session_id):
@@ -630,7 +1051,7 @@ async def sessions_bind_script_set(
     check = await validate_binding(
         script_set_id=req.script_set_id,
         source=source,
-        runtime_plan=RuntimePlan(order_locked=False),
+        runtime_plan=RuntimePlan(order_locked=True),
         runtime_catalog=runtime_catalog,
         requested_products=None,
         recorded_dependencies_by_item=None,
@@ -693,7 +1114,15 @@ async def sessions_bind_script_set(
         if entry is not None:
             entries.append(entry)
     snapshot = build_binding_snapshot(script_set_id=req.script_set_id, entries=entries)
-    meta = dict(meta)
-    meta["script_set_binding"] = snapshot.as_dict()
-    await d.store.set(session_id, meta)
+    await _update_meta(d, session_id, script_set_binding=snapshot.as_dict())
+    d.approved_speech.rebind(session_id)
+    if d.coordinator is not None and d.coordinator.has(session_id):
+        await d.coordinator.interrupt(session_id)
+    if d.director is not None and d.director.has(session_id):
+        try:
+            new_envelope = await d.approved_speech.resolve(session_id)
+        except SpeechRejected:
+            new_envelope = None  # not active/attached yet: the next attach binds it
+        if new_envelope is not None:
+            d.director.get_session(session_id).bind_envelope(new_envelope)
     return {"ok": True, "session_id": session_id, "binding": snapshot.as_dict()}

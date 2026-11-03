@@ -12,6 +12,7 @@ injected sync loaders) without re-running completed segments.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -20,6 +21,11 @@ from backend.application.script_authoring.generation.continuity import (
     build_tail,
     closing_fingerprint,
     extract_ctas,
+)
+from backend.application.script_authoring.generation.unit_brief import (
+    BRIEF_SCHEMA_VERSION,
+    PLANNER_VERSION,
+    provenance,
 )
 from backend.application.script_authoring.generation.segment_generator import (
     SegmentGenerationResult,
@@ -35,6 +41,8 @@ from backend.application.script_authoring.models import (
     new_id,
 )
 from backend.application.script_authoring.workflow import ProductGenerationWorkflow
+
+logger = logging.getLogger(__name__)
 
 # One bounded semantic call that produces the planned section list + fixed K.
 PlanOutcome = Callable[[], tuple[int, list[dict]]]
@@ -114,9 +122,30 @@ class WorkflowDriver:
     # the minimum local change instead of blind regeneration. When None, retry
     # attempts regenerate the segment blindly (still inside the fixed budget).
     segment_repair: Optional[SegmentRepair] = None
+    # Ordered-units mode: gate by unit index (role-specific bounds) and, when a unit
+    # cannot be written, keep every other unit and put a visible placeholder in its
+    # place instead of stopping the product. The placeholder fails the full gate,
+    # so the script lands GATE_FAILED for the owner to finish by hand.
+    segment_gate_at: Optional[Callable[[int, str], Any]] = None
+    failed_unit_text: Optional[Callable[[int], str]] = None  # extractive fallback text
+    # unit index -> machine reason codes of every failed attempt (guards, gate rule ids, LLM
+    # error class); units that ended on the fallback are listed in ``fallback_units``.
+    unit_reasons: dict = field(default_factory=dict)
+    fallback_units: dict = field(default_factory=dict)
+    previous_version_id: str | None = None
+    previous_state: str | None = None
+    replacement_failed: bool = False
+    # Stable part identity per unit index, from the briefs persisted with the plan.
+    part_ids: list = field(default_factory=list)
 
     def is_terminal(self) -> bool:
         return self.workflow.item.state in _TERMINAL
+
+    def cancel(self) -> None:
+        if self.previous_version_id and self.previous_state:
+            self.workflow.item.current_version_id = self.previous_version_id
+            self.workflow.item.state = ScriptState(self.previous_state)
+            self.persist(self.workflow.item)
 
     def step(self) -> bool:
         """Advance exactly one finite phase; False at terminal."""
@@ -150,6 +179,15 @@ class WorkflowDriver:
         wf = self.workflow
         segment_count, candidates = self.plan_generate()
         wf.complete_planning(segment_count=segment_count)
+        briefs = [c.get("brief") for c in candidates[:segment_count]]
+        unit_briefs = None
+        if briefs and all(briefs):
+            self.part_ids = [b["part_id"] for b in briefs]
+            unit_briefs = {
+                "schema_version": BRIEF_SCHEMA_VERSION,
+                "planner_version": PLANNER_VERSION,
+                "parts": briefs,
+            }
         plan = ProductScriptPlan(
             id=wf.plan_id or new_id("plan"),
             script_item_id=wf.item.id,
@@ -171,6 +209,7 @@ class WorkflowDriver:
                 for idx, c in enumerate(candidates[:segment_count])
             ],
             fingerprint=wf.item.id,
+            unit_briefs=unit_briefs,
         )
         self.persist(plan)
 
@@ -217,17 +256,22 @@ class WorkflowDriver:
             else:
                 outcome = self.segment_generate(index, continuity, segment_target)
             if outcome.error is not None:
-                wf.segment_failed(index, message=str(outcome.error))
-                self.persist(wf.item)
+                self.unit_reasons.setdefault(index, []).append(str(outcome.error))
+                self._unit_failed(index, attempt, str(outcome.error), gate_exhausted=False)
                 return
             result = outcome.result
             if result is None:
-                wf.segment_failed(index, message="segment generator returned no result")
-                self.persist(wf.item)
+                self._unit_failed(
+                    index, attempt, "segment generator returned no result", gate_exhausted=False
+                )
                 return
             # ONE deterministic Segment Gate evaluation per semantic candidate
             # (reviewer R9.2/3.4): never gate the same candidate twice.
-            gate = wf.segment_gate(result.spoken_text, segment_target)
+            gate = (
+                self.segment_gate_at(index, result.spoken_text)
+                if self.segment_gate_at is not None
+                else wf.segment_gate(result.spoken_text, segment_target)
+            )
             # Persist the immutable candidate + its GateRun as auditable attempt
             # evidence — a failed candidate before the final attempt must not
             # disappear even though LLM money was spent on it.
@@ -238,6 +282,7 @@ class WorkflowDriver:
                 attempt=attempt,
                 gate_result=gate,
             )
+            self._stamp(candidate, index, "llm")
             self.persist(candidate)
             if wf.last_gate_run is not None:
                 self.persist(wf.last_gate_run)
@@ -246,13 +291,29 @@ class WorkflowDriver:
                 break
             # gate failed: budget remaining -> constrain-repair/regenerate THIS
             # index in place with the exact failed rules as context.
+            codes = [
+                v.rule_id
+                for v in gate.violations
+                if str(getattr(v.severity, "value", "")) == "error"
+            ]
+            self.unit_reasons.setdefault(index, []).extend(codes)
+            logger.warning(
+                "script unit rejected by gate product=%s unit=%s attempt=%s rules=%s detail=%s sample=%r",
+                self.product_id,
+                index,
+                attempt,
+                codes,
+                [v.message[:240] for v in gate.violations if v.rule_id in codes][:6],
+                result.spoken_text[:120],
+            )
             last_failure = (result, gate)
         if selected is None:
-            wf.fail_segment_gate(
+            self._unit_failed(
                 index,
-                message=f"segment {index} gate failed after {attempts} semantic attempts",
+                attempts,
+                f"segment {index} gate failed after {attempts} semantic attempts",
+                gate_exhausted=True,
             )
-            self.persist(wf.item)
             return
         # Advance the bounded cross-segment state so the next prompt avoids the
         # previous tail / covered claims / used opening fingerprints (15.4).
@@ -273,10 +334,45 @@ class WorkflowDriver:
             next_topic=None,
         )
 
+    def _unit_failed(self, index: int, attempt: int, message: str, *, gate_exhausted: bool) -> None:
+        wf = self.workflow
+        if self.failed_unit_text is None:
+            if gate_exhausted:
+                wf.fail_segment_gate(index, message=message)
+            else:
+                wf.segment_failed(index, message=message)
+            self.persist(wf.item)
+            return
+        wf.last_error = message
+        reasons = self.unit_reasons.get(index) or [message]
+        self.fallback_units[index] = list(reasons)
+        logger.warning(
+            "script unit fell back to extractive text product=%s unit=%s reasons=%s",
+            self.product_id,
+            index,
+            reasons[:8],
+        )
+        fallback = wf.record_failed_unit(
+            index, self.failed_unit_text(index), version=attempt + 1, message=message
+        )
+        self._stamp(fallback, index, "fallback", reasons)
+        self.persist(fallback)
+
+    def _stamp(self, segment, index: int, source: str, reasons=None) -> None:
+        if index < len(self.part_ids):
+            segment.part_id = self.part_ids[index]
+        segment.provenance = provenance(source, reasons)
+
     def _compile_and_gate(self) -> None:
         wf = self.workflow
-        wf.compile_and_full_gate()
+        result = wf.compile_and_full_gate()
+        if not result.passed and self.previous_version_id and self.previous_state:
+            self.replacement_failed = True
+            wf.item.current_version_id = self.previous_version_id
+            wf.item.state = ScriptState(self.previous_state)
+            self.persist(wf.item)
         if wf.current_version is not None:
+            wf.current_version.plan_version = self.plan_version
             self.persist(wf.current_version)
         if wf.last_gate_run is not None:
             self.persist(wf.last_gate_run)
@@ -300,6 +396,12 @@ class WorkflowDriver:
                 for idx, seg in sorted(wf.segments.items())
             ],
             "version_ids": [v.id for v in wf.versions],
+            "fallback_units": {str(i): list(r)[:8] for i, r in self.fallback_units.items()},
+            "previous_version_id": self.previous_version_id,
+            "previous_state": self.previous_state,
+            "replacement_failed": self.replacement_failed,
+            "plan_version": self.plan_version,
+            "part_ids": list(self.part_ids),
         }
 
     def restore(self, state: dict) -> None:
@@ -317,10 +419,22 @@ class WorkflowDriver:
         wf.plan_segment_count = state.get("plan_segment_count")
         wf.target_duration_s = state.get("target_duration_s")
         wf.semantic_calls = int(state.get("semantic_calls", 0))
+        self.previous_version_id = state.get("previous_version_id")
+        self.part_ids = list(state.get("part_ids") or [])
+        self.previous_state = state.get("previous_state")
+        self.replacement_failed = bool(state.get("replacement_failed", False))
+        self.plan_version = int(state.get("plan_version", self.plan_version))
+        self.fallback_units = {
+            int(i): list(r) for i, r in (state.get("fallback_units") or {}).items()
+        }
+        wf.segments = {}
+        wf.versions = []
+        wf.current_version = None
         for entry in state.get("segment_versions", []):
             segment = self.load_segment(entry["id"])
             wf.segments[int(entry["index"])] = segment
-        for version_id in state.get("version_ids", []):
+        for version_id in dict.fromkeys(state.get("version_ids", [])):
             version = self.load_version(version_id)
             wf.versions.append(version)
-            wf.current_version = version
+            if version.id == wf.item.current_version_id:
+                wf.current_version = version

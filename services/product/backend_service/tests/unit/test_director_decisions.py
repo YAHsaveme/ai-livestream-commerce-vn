@@ -561,15 +561,25 @@ def test_answered_cluster_is_not_selected_again(monkeypatch: pytest.MonkeyPatch)
     state.products[0].is_introduced = True
     director = Director(state=state, cfg=StreamConfig(max_clusters_per_product=4))
     comments = [
-        Comment(id="price-1", text="áo hoodie giá bao nhiêu", embedding=[1.0, 0.0], t=10.0),
-        Comment(id="price-2", text="hoodie nhiêu tiền", embedding=[1.0, 0.0], t=10.1),
+        Comment(
+            id="price-1",
+            text="áo hoodie giá bao nhiêu",
+            embedding=[1.0, 0.0],
+            t=10.0,
+            intent="price",
+        ),
+        Comment(
+            id="price-2", text="hoodie nhiêu tiền", embedding=[1.0, 0.0], t=10.1, intent="price"
+        ),
     ]
 
     director.state.products[0].stage_turn_index = 2
     first = director.decide(comments, now=10.0)
     director.mark_answered(first)
     expanded = comments + [
-        Comment(id="price-3", text="hoodie giá sao shop", embedding=[1.0, 0.0], t=10.5)
+        Comment(
+            id="price-3", text="hoodie giá sao shop", embedding=[1.0, 0.0], t=10.5, intent="price"
+        )
     ]
     second = director.decide(expanded, now=11.0)
 
@@ -736,3 +746,64 @@ def test_locked_intro_prevents_director_from_consuming_comments(
         coordinator.stop(session_id)
 
     asyncio.run(run())
+
+
+def _lone_usage_question() -> list[Comment]:
+    return [
+        Comment(
+            id="P004-solo",
+            text="mặc size L được không ạ",
+            embedding=[1.0, 0.0],
+            t=500.0,
+            intent="usage",
+            product_id="P004",
+        )
+    ]
+
+
+def _open_qna_window(director: Director) -> None:
+    director.state.qa_window_open = True
+    director.state.qa_window_started_at = 500.0
+    director.state.qa_window_stage_index = 2
+
+
+def test_a_lone_question_is_ignored_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DIRECTOR_EMBEDDER", "hash")
+    director = _cross_product_director()
+    _open_qna_window(director)
+    decision = director.decide(_lone_usage_question(), now=500.0)
+    assert decision.action not in {"answer_fact", "answer_cluster"}
+
+
+def test_a_lone_question_is_answered_when_the_minimum_cluster_size_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DIRECTOR_EMBEDDER", "hash")
+    director = _cross_product_director()
+    director.cfg.qa_min_cluster_size = 1
+    _open_qna_window(director)
+    decision = director.decide(_lone_usage_question(), now=500.0)
+    assert decision.action in {"answer_fact", "answer_cluster"}
+
+
+def test_minimum_cluster_size_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DIRECTOR_QA_MIN_CLUSTER_SIZE", raising=False)
+    assert StreamConfig.from_env().qa_min_cluster_size == 2
+    monkeypatch.setenv("DIRECTOR_QA_MIN_CLUSTER_SIZE", "1")
+    assert StreamConfig.from_env().qa_min_cluster_size == 1
+    monkeypatch.setenv("DIRECTOR_QA_MIN_CLUSTER_SIZE", "abc")
+    assert StreamConfig.from_env().qa_min_cluster_size == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 3), ("1", 1), ("5", 5), ("0", 1), ("99", 5), ("abc", 3)],
+)
+def test_qa_clusters_per_window_comes_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: int
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("DIRECTOR_MAX_QA_CLUSTERS_PER_WINDOW", raising=False)
+    else:
+        monkeypatch.setenv("DIRECTOR_MAX_QA_CLUSTERS_PER_WINDOW", raw)
+    assert StreamConfig.from_env().max_qa_clusters_per_window == expected

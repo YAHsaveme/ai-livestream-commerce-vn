@@ -467,6 +467,9 @@ class MockRenderBackend(StreamingAvatarBackend):
     frames. Fully offline; no LiveKit, no network.
     """
 
+    # offline renderer: nothing to override, accepts it for dev/tests
+    avatar_override_mode = "avatar_and_voice"
+
     name = "mock"
 
     def __init__(self, fps: int = 25, width: int = 640, height: int = 360) -> None:

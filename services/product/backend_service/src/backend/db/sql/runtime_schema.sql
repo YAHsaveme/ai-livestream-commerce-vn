@@ -256,6 +256,13 @@ CREATE TABLE IF NOT EXISTS script_segments (
 
 CREATE INDEX IF NOT EXISTS idx_script_segments_item_id ON script_segments (script_item_id);
 
+-- Script coherence (additive, nullable, no backfill): immutable per-part briefs live on the
+-- plan; each segment version carries its stable part_id and normalized provenance.
+ALTER TABLE product_script_plans ADD COLUMN IF NOT EXISTS unit_briefs JSONB;
+ALTER TABLE script_segments
+    ADD COLUMN IF NOT EXISTS part_id TEXT,
+    ADD COLUMN IF NOT EXISTS provenance JSONB;
+
 CREATE TABLE IF NOT EXISTS script_generation_batches (
     id                    TEXT PRIMARY KEY,
     script_set_id         TEXT NOT NULL REFERENCES script_sets(id) ON DELETE CASCADE,
@@ -305,11 +312,39 @@ CREATE TABLE IF NOT EXISTS script_generation_jobs (
 );
 
 ALTER TABLE script_generation_jobs
+    ADD COLUMN IF NOT EXISTS input_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS lease_owner TEXT,
     ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS lease_epoch BIGINT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_script_jobs_batch_id ON script_generation_jobs (batch_id);
+
+-- Reserve semantic writes before provider dispatch. Restarting a worker cannot
+-- reset the per-part cost ceiling or spend another round on the same operation.
+CREATE TABLE IF NOT EXISTS script_model_write_budget (
+    batch_id TEXT NOT NULL REFERENCES script_generation_batches(id) ON DELETE CASCADE,
+    product_id TEXT NOT NULL,
+    unit_index INT NOT NULL CHECK (unit_index >= 0),
+    operation_id TEXT NOT NULL,
+    writes INT NOT NULL CHECK (writes BETWEEN 1 AND 3),
+    PRIMARY KEY (batch_id, product_id, unit_index, operation_id)
+);
+-- Existing installations retain CREATE TABLE's old two-write constraint.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'script_model_write_budget'::regclass
+          AND conname = 'script_model_write_budget_writes_check'
+          AND pg_get_constraintdef(oid) LIKE '%<= 2%'
+    ) THEN
+        ALTER TABLE script_model_write_budget
+            DROP CONSTRAINT script_model_write_budget_writes_check;
+        ALTER TABLE script_model_write_budget
+            ADD CONSTRAINT script_model_write_budget_writes_check CHECK (writes BETWEEN 1 AND 3);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_script_jobs_item_id ON script_generation_jobs (script_item_id);
 
 -- Batch idempotency fingerprint -> batch_id (survives restart; first wins).
